@@ -1,0 +1,914 @@
+process.env.NODE_ENV = 'test';
+import { pool } from '../src/config/database';
+import app from '../src/index';
+import { Server } from 'http';
+import { createHash } from 'crypto';
+
+interface TestResult {
+  name: string;
+  passed: boolean;
+  error?: string;
+}
+
+const results: TestResult[] = [];
+const issuedTokens: string[] = [];
+
+function sessionToken(response: Response): string {
+  const cookie = response.headers.get('set-cookie') || '';
+  const token = cookie.match(/hspsms_session=([^;]+)/)?.[1] || '';
+  if (token) issuedTokens.push(token);
+  return token;
+}
+
+async function assert(name: string, condition: boolean, message?: string) {
+  if (condition) {
+    console.log(`  ✅ PASS: ${name}`);
+    results.push({ name, passed: true });
+  } else {
+    console.error(`  ❌ FAIL: ${name} - ${message}`);
+    results.push({ name, passed: false, error: message });
+  }
+}
+
+async function run() {
+  console.log('\n======================================================');
+  console.log('🧪 HSPSMS TEACHER MODULE VERIFICATION TEST SUITE');
+  console.log('======================================================\n');
+
+  // Start test server on port 5001
+  const server: Server = await new Promise((resolve) => {
+    const s = app.listen(5001, () => resolve(s));
+  });
+  const baseUrl = 'http://localhost:5001/api/v1';
+
+  try {
+    // -----------------------------------------------------------------
+    // TEST 0: Public account registration from login page
+    // -----------------------------------------------------------------
+    console.log('\n--- 0. Self Registration ---');
+    // Use a unique email/admission no. per run and clean up afterwards, so the
+    // suite stays idempotent (a fixed email would collide on the second run).
+    const signupStamp = Date.now();
+    const signupEmail = `aster.tesfaye.${signupStamp}@example.com`;
+    const signupAdmissionNo = `APP-NEW-${signupStamp}`;
+    const signupPayload = {
+      role: 'student',
+      firstName: 'Aster',
+      lastName: 'Tesfaye',
+      email: signupEmail,
+      phone: '+251911100011',
+      password: 'AsterPass#2026',
+      idNumber: signupAdmissionNo
+    };
+
+    const registerRes = await fetch(`${baseUrl}/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(signupPayload)
+    });
+    const registerData = await registerRes.json();
+    await assert('User can register from the login page (201)', registerRes.status === 201 && !!registerData?.data?.user?.username);
+
+    // Verify the newly registered account can immediately log in.
+    const newUserLoginRes = await fetch(`${baseUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: signupEmail, password: signupPayload.password })
+    });
+    const newUserLoginData = await newUserLoginRes.json();
+    const newUserToken = sessionToken(newUserLoginRes);
+    await assert('Newly registered account can log in (200)', newUserLoginRes.status === 200 && !!newUserToken && !newUserLoginData?.data?.token);
+    await assert('Login sets an HttpOnly SameSite cookie', /HttpOnly/i.test(newUserLoginRes.headers.get('set-cookie') || '') && /SameSite=Lax/i.test(newUserLoginRes.headers.get('set-cookie') || ''));
+    await assert('Newly registered account has student role', newUserLoginData?.data?.user?.roles?.includes('student'));
+    const meWithCookie = await fetch(`${baseUrl}/auth/me`, { headers: { Cookie: `hspsms_session=${newUserToken}` } });
+    await assert('HttpOnly session cookie authenticates protected identity route', meWithCookie.status === 200);
+
+    const [signupUsers]: any = await pool.query('SELECT id FROM users WHERE email = ?', [signupEmail]);
+    const signupUserId = signupUsers[0].id;
+    await pool.query('UPDATE refresh_sessions SET expires_at = DATE_SUB(NOW(3), INTERVAL 1 MINUTE) WHERE token_hash = ?', [createHash('sha256').update(newUserToken).digest('hex')]);
+    const expiredSessionRes = await fetch(`${baseUrl}/auth/me`, { headers: { Cookie: `hspsms_session=${newUserToken}` } });
+    await assert('Expired database-backed session is rejected', expiredSessionRes.status === 401);
+
+    await pool.query('UPDATE users SET status = \'disabled\' WHERE id = ?', [signupUserId]);
+    const disabledLoginRes = await fetch(`${baseUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: signupEmail, password: signupPayload.password })
+    });
+    await pool.query('UPDATE users SET status = \'active\' WHERE id = ?', [signupUserId]);
+    await assert('Disabled accounts are rejected', disabledLoginRes.status === 403);
+
+    const injectionRes = await fetch(`${baseUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: "' OR 1=1 --", password: 'not-a-password' })
+    });
+    const injectionData = await injectionRes.json();
+    await assert('SQL injection login input is rejected generically', injectionRes.status === 401 && injectionData?.error?.code === 'INVALID_CREDENTIALS');
+
+    const resetToken = 'test-single-use-reset-token';
+    const resetHash = createHash('sha256').update(resetToken).digest('hex');
+    await pool.query(
+      `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+       VALUES (?, ?, DATE_ADD(NOW(3), INTERVAL 15 MINUTE))`,
+      [signupUserId, resetHash]
+    );
+    const resetRes = await fetch(`${baseUrl}/auth/reset-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: resetToken, password: 'UpdatedStudentPass#2026' })
+    });
+    const resetAgainRes = await fetch(`${baseUrl}/auth/reset-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: resetToken, password: 'UpdatedStudentPass#2026' })
+    });
+    await assert('Password reset token is single-use', resetRes.status === 200 && resetAgainRes.status === 400);
+
+    const expiredResetToken = 'test-expired-reset-token';
+    const expiredResetHash = createHash('sha256').update(expiredResetToken).digest('hex');
+    await pool.query(
+      `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+       VALUES (?, ?, DATE_SUB(NOW(3), INTERVAL 1 MINUTE))`,
+      [signupUserId, expiredResetHash]
+    );
+    const expiredResetRes = await fetch(`${baseUrl}/auth/reset-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: expiredResetToken, password: 'UpdatedStudentPass#2026' })
+    });
+    await assert('Expired password reset token is rejected', expiredResetRes.status === 400);
+
+    // Duplicate registration of the same email must be rejected.
+    const duplicateRegisterRes = await fetch(`${baseUrl}/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...signupPayload, idNumber: `${signupAdmissionNo}-DUP` })
+    });
+    await assert('Duplicate email registration rejected (409)', duplicateRegisterRes.status === 409);
+
+    // Clean up the self-registered student account
+    await pool.query('DELETE FROM audit_logs WHERE actor_user_id = ?', [signupUserId]);
+    await pool.query('DELETE FROM refresh_sessions WHERE user_id = ?', [signupUserId]);
+    await pool.query('DELETE FROM password_reset_tokens WHERE user_id = ?', [signupUserId]);
+    await pool.query('DELETE FROM students WHERE admission_no = ?', [signupAdmissionNo]);
+    await pool.query('DELETE ur FROM user_roles ur JOIN users u ON u.id = ur.user_id WHERE u.email = ?', [signupEmail]);
+    await pool.query('DELETE FROM users WHERE email = ?', [signupEmail]);
+
+    for (const role of ['teacher', 'registrar', 'librarian', 'administrator'] as const) {
+      const roleEmail = `${role}.signup.${signupStamp}@example.com`;
+      const employeeNo = `EMP-${role.slice(0, 3)}-${String(signupStamp).slice(-6)}`;
+      const staffSignupRes = await fetch(`${baseUrl}/auth/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          role,
+          firstName: 'Dawit',
+          lastName: role,
+          email: roleEmail,
+          phone: '+251911100099',
+          password: 'StaffSignupPass#2026',
+          idNumber: employeeNo
+        })
+      });
+      const staffSignupData = await staffSignupRes.json();
+      const roleCode = role === 'administrator' ? 'system_admin' : role;
+      await assert(`${role} registration request is accepted pending approval`, staffSignupRes.status === 201 && staffSignupData?.data?.pendingApproval === true && !staffSignupRes.headers.get('set-cookie'));
+
+      const [accountRows]: any = await pool.query(
+        `SELECT u.id, u.status, r.code FROM users u
+         JOIN user_roles ur ON ur.user_id = u.id JOIN roles r ON r.id = ur.role_id
+         WHERE u.email = ?`,
+        [roleEmail]
+      );
+      await assert(`${role} account remains invited with the requested role`, accountRows[0]?.status === 'invited' && accountRows[0]?.code === roleCode);
+
+      const pendingLoginRes = await fetch(`${baseUrl}/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: roleEmail, password: 'StaffSignupPass#2026' })
+      });
+      const pendingLoginData = await pendingLoginRes.json();
+      await assert(`${role} cannot sign in before approval`, pendingLoginRes.status === 403 && pendingLoginData?.error?.code === 'ACCOUNT_PENDING_APPROVAL');
+
+      await pool.query('DELETE FROM audit_logs WHERE actor_user_id = ?', [accountRows[0].id]);
+      await pool.query('DELETE FROM refresh_sessions WHERE user_id = ?', [accountRows[0].id]);
+      await pool.query('DELETE FROM staff WHERE user_id = ?', [accountRows[0].id]);
+      await pool.query('DELETE FROM user_roles WHERE user_id = ?', [accountRows[0].id]);
+      await pool.query('DELETE FROM users WHERE id = ?', [accountRows[0].id]);
+    }
+
+    // Public school homepage content should be available to visitors before sign-in.
+    const publicHomeRes = await fetch(`${baseUrl}/public/home`);
+    const publicHomeData = await publicHomeRes.json();
+    await assert('Public home page is available to anonymous visitors (200)', publicHomeRes.status === 200 && !!publicHomeData?.data?.school?.name);
+
+    // Pre-flight test idempotency: ensure assessment 1 marks are in draft and section 1 has timetable entry
+
+    // -----------------------------------------------------------------
+    // TEST 1: Health check
+    // -----------------------------------------------------------------
+    console.log('--- 1. Health & Database Connectivity ---');
+    const healthRes = await fetch(`${baseUrl}/health`);
+    const healthData = await healthRes.json();
+    await assert('Backend and MySQL are healthy', healthRes.status === 200 && healthData.status === 'healthy');
+
+    const teacherUsername = process.env.SEED_TEACHER_USERNAME || 't.elias';
+    const teacherPassword = process.env.SEED_TEACHER_PASSWORD || 'EliasPass#2026';
+    const studentUsername = process.env.SEED_STUDENT_USERNAME || 'student.hana';
+    const studentPassword = process.env.SEED_STUDENT_PASSWORD || 'StudentPass#2026';
+    const otherTeacherUsername = process.env.SEED_OTHER_TEACHER_USERNAME || 't.other';
+    const otherTeacherPassword = process.env.SEED_OTHER_TEACHER_PASSWORD || 'OtherPass#2026';
+    const adminUsername = process.env.SEED_ADMIN_USERNAME || 'admin';
+    const adminPassword = process.env.SEED_ADMIN_PASSWORD || 'AdminPass#2026';
+    const librarianUsername = process.env.SEED_LIBRARIAN_USERNAME || 'librarian';
+    const librarianPassword = process.env.SEED_LIBRARIAN_PASSWORD || 'LibrarianPass#2026';
+    const registrarUsername = process.env.SEED_REGISTRAR_USERNAME || 'registrar';
+    const registrarPassword = process.env.SEED_REGISTRAR_PASSWORD || 'RegistrarPass#2026';
+    const parentUsername = process.env.SEED_PARENT_USERNAME || 'parent.kassa';
+    const parentPassword = process.env.SEED_PARENT_PASSWORD || 'ParentPass#2026';
+
+    await pool.query(`UPDATE marks SET status = 'draft' WHERE assessment_id = 1`);
+    const [tt1]: any = await pool.query(`SELECT id FROM timetable_entries WHERE section_id = 1 LIMIT 1`);
+    if (tt1.length === 0) {
+      await pool.query(`INSERT INTO timetable_entries (term_id, section_id, subject_id, staff_id, room_id, time_slot_id) VALUES (3, 1, 1, 5, 1, 1)`);
+    }
+
+    // -----------------------------------------------------------------
+    // TEST 2: Unauthenticated requests rejected
+    // -----------------------------------------------------------------
+    console.log('\n--- 2. Authentication & Authorization Guards ---');
+    const unauthRes = await fetch(`${baseUrl}/teacher/dashboard`);
+    await assert('Unauthenticated teacher request rejected (401)', unauthRes.status === 401);
+
+    // -----------------------------------------------------------------
+    // TEST 3: Login as Teacher
+    // -----------------------------------------------------------------
+    const loginRes = await fetch(`${baseUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: teacherUsername, password: teacherPassword })
+    });
+    const loginData = await loginRes.json();
+    await assert('Teacher login succeeds (200)', loginRes.status === 200);
+    const teacherToken = sessionToken(loginRes);
+    await assert('Login credential is issued only in an HttpOnly cookie', !!teacherToken && !loginData?.data?.token);
+    await assert('User has teacher role', loginData?.data?.user?.roles?.includes('teacher'));
+    await assert('Teacher profile resolved', loginData?.data?.user?.staff?.fullName === 'Elias Kebede');
+
+
+    const [teacherUserRows]: any = await pool.query('SELECT email FROM users WHERE username = ?', [teacherUsername]);
+    const knownTeacherEmail = teacherUserRows?.[0]?.email || `${teacherUsername}@school.et`;
+    const forgotPasswordRes = await fetch(`${baseUrl}/auth/forgot-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: knownTeacherEmail })
+    });
+    const forgotPasswordData = await forgotPasswordRes.json();
+    const unknownForgotRes = await fetch(`${baseUrl}/auth/forgot-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: `missing.${Date.now()}@example.com` })
+    });
+    const unknownForgotData = await unknownForgotRes.json();
+    await assert('Recovery does not return a reset token and reports SMTP availability', forgotPasswordRes.status === 200 && !forgotPasswordData?.data?.resetToken && forgotPasswordData?.data?.deliveryConfigured === false);
+    await assert('Recovery response is generic for known and unknown addresses', JSON.stringify(forgotPasswordData?.data) === JSON.stringify(unknownForgotData?.data));
+
+    // -----------------------------------------------------------------
+    // TEST 4: Login as Non-Teacher Student & Verify 403
+    // -----------------------------------------------------------------
+    const studLoginRes = await fetch(`${baseUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: studentUsername, password: studentPassword })
+    });
+    const studLoginData = await studLoginRes.json();
+    const studentToken = sessionToken(studLoginRes);
+
+    const studentForbiddenRes = await fetch(`${baseUrl}/teacher/dashboard`, {
+      headers: { Authorization: `Bearer ${studentToken}` }
+    });
+    await assert('Student forbidden from accessing teacher dashboard (403)', studentForbiddenRes.status === 403);
+
+    // -----------------------------------------------------------------
+    // TEST 5: Teacher Dashboard Metrics from real DB
+    // -----------------------------------------------------------------
+    console.log('\n--- 3. Teacher Dashboard & Classes ---');
+    const dashRes = await fetch(`${baseUrl}/teacher/dashboard`, {
+      headers: { Cookie: `hspsms_session=${teacherToken}` }
+    });
+    const dashData = await dashRes.json();
+    await assert('Dashboard returns 200', dashRes.status === 200);
+    await assert('Dashboard assignedSections >= 1', dashData?.data?.overview?.assignedSections >= 1);
+    await assert('Dashboard assignedClasses >= 4', dashData?.data?.overview?.assignedClasses >= 4);
+    await assert('Assigned classes list populated from DB', dashData?.data?.assignedClasses?.length >= 4);
+    await assert('Timetable entries loaded from DB', dashData?.data?.timetable?.length >= 1);
+    await assert('Announcements loaded from DB', dashData?.data?.announcements?.length >= 1);
+
+    // -----------------------------------------------------------------
+    // TEST 6: Get Section Students (Roster)
+    // -----------------------------------------------------------------
+    const rosterRes = await fetch(`${baseUrl}/teacher/classes/1/students`, {
+      headers: { Authorization: `Bearer ${teacherToken}` }
+    });
+    const rosterData = await rosterRes.json();
+    await assert('Roster for Section 1 returns 200', rosterRes.status === 200);
+    await assert('15 enrolled students returned', rosterData?.data?.length === 15);
+    await assert('First student is Hana Bekele', rosterData?.data[0]?.first_name === 'Hana');
+
+    // -----------------------------------------------------------------
+    // TEST 7: Cross-Teacher Record-Level Security Check
+    // -----------------------------------------------------------------
+    console.log('\n--- 4. Record-Level Scope & Isolation ---');
+    const otherLoginRes = await fetch(`${baseUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: otherTeacherUsername, password: otherTeacherPassword })
+    });
+    const otherLoginData = await otherLoginRes.json();
+    const otherTeacherToken = sessionToken(otherLoginRes);
+
+    // t.other tries to access Section 1 (assigned to Elias, not Abebe)
+    const crossAccessRes = await fetch(`${baseUrl}/teacher/classes/1/students`, {
+      headers: { Authorization: `Bearer ${otherTeacherToken}` }
+    });
+    await assert('Teacher forbidden from accessing unassigned section (403)', crossAccessRes.status === 403);
+
+    // -----------------------------------------------------------------
+    // TEST 8: Attendance Recording (Transaction, DB Persistence)
+    // -----------------------------------------------------------------
+    console.log('\n--- 5. Attendance Recording Workflow ---');
+    const today = new Date().toISOString().split('T')[0];
+
+    // Submit attendance for Section 1
+    const attPayload = {
+      sectionId: 1,
+      attendanceDate: today,
+      subjectId: 1,
+      status: 'submitted',
+      records: [
+        { enrollmentId: 1, statusCode: 'present' },
+        { enrollmentId: 2, statusCode: 'absent', note: 'Sick' },
+        { enrollmentId: 3, statusCode: 'late', note: 'Bus delay' },
+        { enrollmentId: 4, statusCode: 'excused', note: 'Permission' },
+        { enrollmentId: 5, statusCode: 'present' }
+      ]
+    };
+
+    const attRecordRes = await fetch(`${baseUrl}/attendance/record`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${teacherToken}`
+      },
+      body: JSON.stringify(attPayload)
+    });
+    const attRecordData = await attRecordRes.json();
+    await assert('Attendance record persists to MySQL (200)', attRecordRes.status === 200);
+    await assert('Session created and records linked', attRecordData?.data?.records?.length >= 5);
+
+    // Retrieve attendance session from DB
+    const getAttRes = await fetch(`${baseUrl}/attendance/session?sectionId=1&date=${today}`, {
+      headers: { Authorization: `Bearer ${teacherToken}` }
+    });
+    const getAttData = await getAttRes.json();
+    await assert('Retrieve saved attendance session from DB (200)', getAttRes.status === 200);
+    await assert('Student 1 marked present in DB', getAttData?.data?.records?.find((r: any) => r.enrollment_id === 1)?.status_code === 'present');
+    await assert('Student 2 marked absent in DB', getAttData?.data?.records?.find((r: any) => r.enrollment_id === 2)?.status_code === 'absent');
+
+    // Reject invalid enrollment
+    const badAttRes = await fetch(`${baseUrl}/attendance/record`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${teacherToken}`
+      },
+      body: JSON.stringify({
+        sectionId: 1,
+        attendanceDate: today,
+        status: 'submitted',
+        records: [{ enrollmentId: 99999, statusCode: 'present' }]
+      })
+    });
+    await assert('Attendance rejected for invalid student enrollment (422)', badAttRes.status === 422);
+
+    // -----------------------------------------------------------------
+    // TEST 9: Assessment & Marks Lifecycle
+    // -----------------------------------------------------------------
+    console.log('\n--- 6. Assessment & Marks Validation Lifecycle ---');
+    const assTypesRes = await fetch(`${baseUrl}/assessments/types`, {
+      headers: { Authorization: `Bearer ${teacherToken}` }
+    });
+    const assTypesData = await assTypesRes.json();
+    await assert('Assessment types retrieved from DB (200)', assTypesRes.status === 200 && assTypesData?.data?.length > 0);
+
+    const assessmentsRes = await fetch(`${baseUrl}/assessments`, {
+      headers: { Authorization: `Bearer ${teacherToken}` }
+    });
+    const assessmentsData = await assessmentsRes.json();
+    await assert('Teacher assessments retrieved from DB', assessmentsRes.status === 200 && assessmentsData?.data?.length >= 1);
+    const assessmentId = assessmentsData.data[0].id;
+    const maxScore = Number(assessmentsData.data[0].max_score); // 30.00
+
+    // Reject mark exceeding max score (> 30)
+    const exceedMarkRes = await fetch(`${baseUrl}/assessments/${assessmentId}/marks`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${teacherToken}`
+      },
+      body: JSON.stringify({
+        status: 'draft',
+        marks: [{ enrollmentId: 1, score: 35.0, feedback: 'Too high' }]
+      })
+    });
+    const exceedData = await exceedMarkRes.json();
+    await assert('Reject mark exceeding max_score (422 MARK_OUT_OF_RANGE)', exceedMarkRes.status === 422 && exceedData?.error?.code === 'MARK_OUT_OF_RANGE');
+
+    // Reject negative mark (< 0)
+    const negativeMarkRes = await fetch(`${baseUrl}/assessments/${assessmentId}/marks`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${teacherToken}`
+      },
+      body: JSON.stringify({
+        status: 'draft',
+        marks: [{ enrollmentId: 1, score: -5.0 }]
+      })
+    });
+    await assert('Reject negative mark (422 NEGATIVE_SCORE)', negativeMarkRes.status === 422);
+
+    // Save valid marks as Draft
+    const validMarks = [
+      { enrollmentId: 1, score: 27.5, feedback: 'Excellent grasp of mechanics' },
+      { enrollmentId: 2, score: 24.0, feedback: 'Good conceptual grasp' },
+      { enrollmentId: 3, score: 18.0, feedback: 'Needs revision' }
+    ];
+
+    const saveMarksRes = await fetch(`${baseUrl}/assessments/${assessmentId}/marks`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${teacherToken}`
+      },
+      body: JSON.stringify({
+        status: 'draft',
+        marks: validMarks
+      })
+    });
+    await assert('Save marks draft successfully (200)', saveMarksRes.status === 200);
+
+    // Verify marks retrieved from MySQL
+    const getMarksRes = await fetch(`${baseUrl}/assessments/${assessmentId}`, {
+      headers: { Authorization: `Bearer ${teacherToken}` }
+    });
+    const getMarksData = await getMarksRes.json();
+    await assert('Retrieve saved marks from DB', getMarksRes.status === 200);
+    const m1 = getMarksData.data.marks.find((m: any) => m.enrollment_id === 1);
+    await assert('Mark score matches saved value (27.50)', parseFloat(m1?.score) === 27.5);
+    await assert('Feedback matches saved value', m1?.feedback === 'Excellent grasp of mechanics');
+
+    // Submit marks for approval
+    const submitMarksRes = await fetch(`${baseUrl}/assessments/${assessmentId}/marks`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${teacherToken}`
+      },
+      body: JSON.stringify({
+        status: 'submitted',
+        marks: validMarks
+      })
+    });
+    await assert('Submit marks for approval workflow (200)', submitMarksRes.status === 200);
+
+    // -----------------------------------------------------------------
+    // TEST 9: Teacher Subjects & Academic Years & Terms
+    // -----------------------------------------------------------------
+    console.log('\n--- 7. Teacher Subjects, Academic Years & Terms ---');
+    const subjRes = await fetch(`${baseUrl}/teacher/subjects`, {
+      headers: { Authorization: `Bearer ${teacherToken}` }
+    });
+    const subjData = await subjRes.json();
+    await assert('Teacher subjects fetched successfully (200)', subjRes.status === 200);
+    await assert('Teacher assigned Physics subject', subjData?.data?.some((s: any) => s.code === 'PHY' && s.name === 'Physics'));
+
+    const ayRes = await fetch(`${baseUrl}/teacher/academic-years`, {
+      headers: { Authorization: `Bearer ${teacherToken}` }
+    });
+    const ayData = await ayRes.json();
+    await assert('Academic years retrieved from DB', ayRes.status === 200 && ayData?.data?.length >= 1);
+    const currentAyId = ayData.data[0].id;
+
+    const termsRes = await fetch(`${baseUrl}/teacher/terms?academicYearId=${currentAyId}`, {
+      headers: { Authorization: `Bearer ${teacherToken}` }
+    });
+    const termsData = await termsRes.json();
+    await assert('Terms retrieved for academic year', termsRes.status === 200 && termsData?.data?.length >= 1);
+
+    // -----------------------------------------------------------------
+    // TEST 10: Filter Assessments by Subject & Section
+    // -----------------------------------------------------------------
+    console.log('\n--- 8. Assessment List Filtering ---');
+    const filterAssRes = await fetch(`${baseUrl}/assessments?subjectId=1&sectionId=1`, {
+      headers: { Authorization: `Bearer ${teacherToken}` }
+    });
+    const filterAssData = await filterAssRes.json();
+    await assert('Filtered assessments query returns 200', filterAssRes.status === 200);
+    await assert('Assessments returned for Subject 1 & Section 1', filterAssData?.data?.length >= 1);
+    await assert('Returned assessment is Physics in Section 1', filterAssData?.data[0]?.subject_id === 1 && filterAssData?.data[0]?.section_id === 1);
+
+    // -----------------------------------------------------------------
+    // TEST 11: Teacher Reports Generation
+    // -----------------------------------------------------------------
+    console.log('\n--- 9. Teacher Reports Generation ---');
+
+    // A. Student Attendance Report
+    const attRepRes = await fetch(`${baseUrl}/teacher/reports/attendance?sectionId=1`, {
+      headers: { Authorization: `Bearer ${teacherToken}` }
+    });
+    const attRepData = await attRepRes.json();
+    await assert('Attendance Report returns 200', attRepRes.status === 200);
+    await assert('Attendance Report contains enrolled students', attRepData?.data?.records?.length === 15);
+    await assert('Attendance Report calculates attendance percentage', typeof attRepData?.data?.records[0]?.attendancePercentage === 'number');
+
+    // B. Assessment Marks Report
+    const marksRepRes = await fetch(`${baseUrl}/teacher/reports/marks?sectionId=1&subjectId=1`, {
+      headers: { Authorization: `Bearer ${teacherToken}` }
+    });
+    const marksRepData = await marksRepRes.json();
+    await assert('Marks Report returns 200', marksRepRes.status === 200);
+    await assert('Marks Report contains records', marksRepData?.data?.records?.length >= 1);
+    await assert('Marks Report has percentage calculation', typeof marksRepData?.data?.records[0]?.percentage === 'number');
+
+    // C. Class Performance Report
+    const classPerfRes = await fetch(`${baseUrl}/teacher/reports/class-performance?sectionId=1&subjectId=1`, {
+      headers: { Authorization: `Bearer ${teacherToken}` }
+    });
+    const classPerfData = await classPerfRes.json();
+    await assert('Class Performance Report returns 200', classPerfRes.status === 200);
+    await assert('Class Performance Report has average score & grade distribution', 
+      classPerfData?.data?.assessments?.length >= 1 && 
+      typeof classPerfData?.data?.assessments[0]?.gradeDistribution?.excellent === 'number'
+    );
+
+    // D. Student Performance Report
+    const studPerfRes = await fetch(`${baseUrl}/teacher/reports/student-performance?sectionId=1&studentId=1`, {
+      headers: { Authorization: `Bearer ${teacherToken}` }
+    });
+    const studPerfData = await studPerfRes.json();
+    await assert('Student Performance Report returns 200', studPerfRes.status === 200);
+    await assert('Student Performance Report returns student profile & assessments', studPerfData?.data?.student?.admission_no === 'HS-2026-0001');
+
+    // E. Assessment Summary Report
+    const assSummRes = await fetch(`${baseUrl}/teacher/reports/assessment-summary?sectionId=1`, {
+      headers: { Authorization: `Bearer ${teacherToken}` }
+    });
+    const assSummData = await assSummRes.json();
+    await assert('Assessment Summary Report returns 200', assSummRes.status === 200);
+    await assert('Assessment Summary Report contains assessments list', assSummData?.data?.assessments?.length >= 1);
+
+    // -----------------------------------------------------------------
+    // TEST 12: Security - Other Teacher cannot access Section 1 reports
+    // -----------------------------------------------------------------
+    console.log('\n--- 10. Report Security Authorization ---');
+    const unauthorizedRepRes = await fetch(`${baseUrl}/teacher/reports/attendance?sectionId=1`, {
+      headers: { Authorization: `Bearer ${otherTeacherToken}` }
+    });
+    await assert('Unauthorized teacher rejected from section report (403)', unauthorizedRepRes.status === 403);
+
+    // -----------------------------------------------------------------
+    // TEST 13: Administrator Dashboard & Operations
+    // -----------------------------------------------------------------
+    console.log('\n--- 11. Administrator Module Tests ---');
+    const adminLoginRes = await fetch(`${baseUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: adminUsername, password: adminPassword })
+    });
+    const adminLoginData = await adminLoginRes.json();
+    const adminToken = sessionToken(adminLoginRes);
+    await assert('Admin login succeeds (200)', adminLoginRes.status === 200 && !!adminToken);
+
+    const adminDashRes = await fetch(`${baseUrl}/admin/dashboard`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const adminDashData = await adminDashRes.json();
+    await assert('Admin dashboard returns 200', adminDashRes.status === 200);
+    await assert('Admin dashboard has student metrics', adminDashData?.data?.overview?.students?.total >= 15);
+    await assert('Admin dashboard has staff metrics', adminDashData?.data?.overview?.staff?.total >= 2);
+    await assert('Admin dashboard has academic overview', adminDashData?.data?.overview?.academic?.totalSections >= 4);
+
+    const adminUsersRes = await fetch(`${baseUrl}/admin/users`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const adminUsersData = await adminUsersRes.json();
+    await assert('Admin users list returns 200', adminUsersRes.status === 200 && adminUsersData?.data?.length >= 4);
+
+    // Admin registers new user account
+    const uniqueUserSuffix = Math.floor(1000 + Math.random() * 9000);
+    const newAdminUserRes = await fetch(`${baseUrl}/admin/users`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({
+        username: `new.staff.${uniqueUserSuffix}`,
+        email: `new.staff.${uniqueUserSuffix}@school.et`,
+        phone: '+251911000111',
+        password: 'SecurePass#2026',
+        roleCode: 'teacher'
+      })
+    });
+    const newAdminUserData = await newAdminUserRes.json();
+    await assert('Admin creates new user account (201)', newAdminUserRes.status === 201 && newAdminUserData?.data?.id > 0);
+
+    const newLoginRes = await fetch(`${baseUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: `new.staff.${uniqueUserSuffix}`, password: 'SecurePass#2026' })
+    });
+    const newAdminUserToken = sessionToken(newLoginRes);
+    await assert('Newly created account authenticates through a session cookie (200)', newLoginRes.status === 200 && !!newAdminUserToken);
+
+    const adminAuditRes = await fetch(`${baseUrl}/admin/audit-logs`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const adminAuditData = await adminAuditRes.json();
+    await assert('Admin audit logs return 200', adminAuditRes.status === 200 && Array.isArray(adminAuditData?.data));
+
+    // Admin Page 9: School Settings
+    const getSettingsRes = await fetch(`${baseUrl}/admin/settings`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const settingsData = await getSettingsRes.json();
+    await assert('Admin GET /settings returns 200', getSettingsRes.status === 200 && Array.isArray(settingsData?.data));
+
+    const updateSettingRes = await fetch(`${baseUrl}/admin/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ key: 'test.verification_marker', value: 'verified_active_2026' })
+    });
+    await assert('Admin PUT /settings persists setting (200)', updateSettingRes.status === 200);
+
+    const recheckSettingsRes = await fetch(`${baseUrl}/admin/settings`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const recheckSettingsData = await recheckSettingsRes.json();
+    const foundMarker = recheckSettingsData?.data?.some((s: any) => s.setting_key === 'test.verification_marker');
+    await assert('Admin updated setting is readable in DB', foundMarker);
+
+    // Admin Page 10: Profile & Security
+    const getProfileRes = await fetch(`${baseUrl}/admin/profile`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const profileData = await getProfileRes.json();
+    await assert('Admin GET /profile returns 200', getProfileRes.status === 200 && profileData?.data?.username === adminUsername);
+
+    const updateProfileRes = await fetch(`${baseUrl}/admin/profile`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ phone: '+251911999888', email: 'admin@school.edu.et' })
+    });
+    await assert('Admin PUT /profile updates contact info (200)', updateProfileRes.status === 200);
+
+    // Password change validation
+    const badPassRes = await fetch(`${baseUrl}/admin/change-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ currentPassword: 'WrongPassword!', newPassword: 'NewSecurePass#2026' })
+    });
+    await assert('Password change fails with wrong current password (400)', badPassRes.status === 400);
+
+    const shortPassRes = await fetch(`${baseUrl}/admin/change-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ currentPassword: adminPassword, newPassword: '123' })
+    });
+    await assert('Password change fails with password shorter than 6 chars (400)', shortPassRes.status === 400);
+
+    const goodPassRes = await fetch(`${baseUrl}/admin/change-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ currentPassword: adminPassword, newPassword: 'TempAdminPass#2026' })
+    });
+    await assert('Password change succeeds with valid credentials (200)', goodPassRes.status === 200);
+
+    // Revert password back so system tests continue to be fully idempotent
+    const revertPassRes = await fetch(`${baseUrl}/admin/change-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ currentPassword: 'TempAdminPass#2026', newPassword: adminPassword })
+    });
+    await assert('Password reverted cleanly back to AdminPass#2026 (200)', revertPassRes.status === 200);
+
+    // Admin Page 8: Communications
+    const commsRes = await fetch(`${baseUrl}/admin/announcements`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const commsData = await commsRes.json();
+    await assert('Admin GET /announcements returns 200', commsRes.status === 200 && Array.isArray(commsData?.data));
+
+    // RBAC: Non-admin users forbidden from administrative operations
+    const studentUnauthAdmin = await fetch(`${baseUrl}/admin/dashboard`, {
+      headers: { Authorization: `Bearer ${studentToken}` }
+    });
+    await assert('Student rejected from admin dashboard (403)', studentUnauthAdmin.status === 403);
+
+    const studentUnauthSettings = await fetch(`${baseUrl}/admin/settings`, {
+      headers: { Authorization: `Bearer ${studentToken}` }
+    });
+    await assert('Student rejected from admin settings (403)', studentUnauthSettings.status === 403);
+
+    const teacherUnauthProfile = await fetch(`${baseUrl}/admin/profile`, {
+      headers: { Authorization: `Bearer ${teacherToken}` }
+    });
+    await assert('Teacher rejected from admin profile (403)', teacherUnauthProfile.status === 403);
+
+    // -----------------------------------------------------------------
+    // TEST 14: Student Dashboard & Records
+    // -----------------------------------------------------------------
+    console.log('\n--- 12. Student Module Tests ---');
+    const studentDashRes = await fetch(`${baseUrl}/student/dashboard`, {
+      headers: { Authorization: `Bearer ${studentToken}` }
+    });
+    const studentDashData = await studentDashRes.json();
+    await assert('Student dashboard returns 200', studentDashRes.status === 200);
+    await assert('Student profile belongs to Hana Bekele', studentDashData?.data?.profile?.admission_no === 'HS-2026-0001');
+    await assert('Student timetable loaded', studentDashData?.data?.timetable?.length >= 1);
+    await assert('Student attendance summary loaded', typeof studentDashData?.data?.attendance?.summary?.rate === 'number');
+
+    // RBAC: Teacher cannot access Student dashboard
+    const teacherUnauthStudent = await fetch(`${baseUrl}/student/dashboard`, {
+      headers: { Authorization: `Bearer ${teacherToken}` }
+    });
+    await assert('Teacher rejected from student dashboard (403)', teacherUnauthStudent.status === 403);
+
+    // -----------------------------------------------------------------
+    // TEST 15: Librarian Dashboard & Operations
+    // -----------------------------------------------------------------
+    console.log('\n--- 13. Librarian Module Tests ---');
+    const libLoginRes = await fetch(`${baseUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: librarianUsername, password: librarianPassword })
+    });
+    const libLoginData = await libLoginRes.json();
+    const libToken = sessionToken(libLoginRes);
+    await assert('Librarian login succeeds (200)', libLoginRes.status === 200 && !!libToken);
+
+    const libDashRes = await fetch(`${baseUrl}/librarian/dashboard`, {
+      headers: { Authorization: `Bearer ${libToken}` }
+    });
+    const libDashData = await libDashRes.json();
+    await assert('Librarian dashboard returns 200', libDashRes.status === 200);
+    await assert('Librarian catalog has books', libDashData?.data?.metrics?.totalBooks >= 5);
+    await assert('Librarian has copies tracked', libDashData?.data?.metrics?.totalCopies >= 5);
+
+    const libBooksRes = await fetch(`${baseUrl}/librarian/books`, {
+      headers: { Authorization: `Bearer ${libToken}` }
+    });
+    const libBooksData = await libBooksRes.json();
+    await assert('Librarian books list returns 200', libBooksRes.status === 200 && libBooksData?.data?.length >= 5);
+
+    const libLoansRes = await fetch(`${baseUrl}/librarian/loans`, {
+      headers: { Authorization: `Bearer ${libToken}` }
+    });
+    const libLoansData = await libLoansRes.json();
+    await assert('Librarian loans list returns 200', libLoansRes.status === 200 && libLoansData?.data?.length >= 1);
+
+    // RBAC: Student cannot access Librarian dashboard
+    const studentUnauthLib = await fetch(`${baseUrl}/librarian/dashboard`, {
+      headers: { Authorization: `Bearer ${studentToken}` }
+    });
+    await assert('Student rejected from librarian dashboard (403)', studentUnauthLib.status === 403);
+
+    // -----------------------------------------------------------------
+    // TEST 16: Registrar Dashboard & Operations
+    // -----------------------------------------------------------------
+    console.log('\n--- 14. Registrar Module Tests ---');
+    const regLoginRes = await fetch(`${baseUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: registrarUsername, password: registrarPassword })
+    });
+    const regLoginData = await regLoginRes.json();
+    const regToken = sessionToken(regLoginRes);
+    await assert('Registrar login succeeds (200)', regLoginRes.status === 200 && !!regToken);
+
+    const regDashRes = await fetch(`${baseUrl}/registrar/dashboard`, {
+      headers: { Authorization: `Bearer ${regToken}` }
+    });
+    const regDashData = await regDashRes.json();
+    await assert('Registrar dashboard returns 200', regDashRes.status === 200);
+    await assert('Registrar total enrolled students >= 15', regDashData?.data?.metrics?.totalStudents >= 15);
+
+    const regStudentsRes = await fetch(`${baseUrl}/registrar/students`, {
+      headers: { Authorization: `Bearer ${regToken}` }
+    });
+    const regStudentsData = await regStudentsRes.json();
+    await assert('Registrar students directory returns 200', regStudentsRes.status === 200 && regStudentsData?.data?.length >= 15);
+
+    const regSectionsRes = await fetch(`${baseUrl}/registrar/sections`, {
+      headers: { Authorization: `Bearer ${regToken}` }
+    });
+    const regSectionsData = await regSectionsRes.json();
+    await assert('Registrar sections list returns 200', regSectionsRes.status === 200 && regSectionsData?.data?.length >= 4);
+
+    const regTransfersRes = await fetch(`${baseUrl}/registrar/transfers`, {
+      headers: { Authorization: `Bearer ${regToken}` }
+    });
+    await assert('Registrar transfers list returns 200', regTransfersRes.status === 200);
+
+    const regDocsRes = await fetch(`${baseUrl}/registrar/documents`, {
+      headers: { Authorization: `Bearer ${regToken}` }
+    });
+    await assert('Registrar student documents return 200', regDocsRes.status === 200);
+
+    // RBAC: Teacher cannot access Registrar dashboard
+    const teacherUnauthReg = await fetch(`${baseUrl}/registrar/dashboard`, {
+      headers: { Authorization: `Bearer ${teacherToken}` }
+    });
+    await assert('Teacher rejected from registrar dashboard (403)', teacherUnauthReg.status === 403);
+
+    // -----------------------------------------------------------------
+    // TEST 17: Parent Dashboard & Linked Children
+    // -----------------------------------------------------------------
+    console.log('\n--- 15. Parent Module Tests ---');
+    const parentLoginRes = await fetch(`${baseUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: parentUsername, password: parentPassword })
+    });
+    const parentLoginData = await parentLoginRes.json();
+    const parentToken = sessionToken(parentLoginRes);
+    await assert('Parent login succeeds (200)', parentLoginRes.status === 200 && !!parentToken);
+
+    const parentDashRes = await fetch(`${baseUrl}/parent/dashboard`, {
+      headers: { Authorization: `Bearer ${parentToken}` }
+    });
+    const parentDashData = await parentDashRes.json();
+    await assert('Parent dashboard returns 200', parentDashRes.status === 200);
+    await assert('Parent has linked children', parentDashData?.data?.children?.length >= 2);
+    await assert('Hana Bekele is among linked children', parentDashData?.data?.children?.some((c: any) => c.admission_no === 'HS-2026-0001'));
+
+    const childDetailsRes = await fetch(`${baseUrl}/parent/children/1`, {
+      headers: { Authorization: `Bearer ${parentToken}` }
+    });
+    const childDetailsData = await childDetailsRes.json();
+    await assert('Parent can access linked child 1 details', childDetailsRes.status === 200);
+    await assert('Child overview contains attendance rate', typeof childDetailsData?.data?.overview?.attendance?.rate === 'number');
+
+    // Security: Parent cannot access unlinked student (e.g. Student 10)
+    const unlinkedChildRes = await fetch(`${baseUrl}/parent/children/10`, {
+      headers: { Authorization: `Bearer ${parentToken}` }
+    });
+    await assert('Parent rejected from unlinked child records (403)', unlinkedChildRes.status === 403);
+
+    const logoutRes = await fetch(`${baseUrl}/auth/logout`, {
+      method: 'POST',
+      headers: { Cookie: `hspsms_session=${teacherToken}` }
+    });
+    const revokedSessionRes = await fetch(`${baseUrl}/teacher/dashboard`, {
+      headers: { Cookie: `hspsms_session=${teacherToken}` }
+    });
+    await assert('Logout revokes the server-side session', logoutRes.status === 200 && revokedSessionRes.status === 401);
+
+    let loginRateLimitObserved = false;
+    for (let attempt = 0; attempt < 15 && !loginRateLimitObserved; attempt += 1) {
+      const limitedLoginRes = await fetch(`${baseUrl}/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: `unknown-rate-limit-${attempt}`, password: 'invalid' })
+      });
+      loginRateLimitObserved = limitedLoginRes.status === 429;
+    }
+    await assert('Repeated failed logins are rate limited', loginRateLimitObserved);
+  } catch (err: any) {
+    console.error('Fatal test error:', err);
+  } finally {
+    if (issuedTokens.length > 0) {
+      const hashes = issuedTokens.map((token) => createHash('sha256').update(token).digest('hex'));
+      await pool.query('DELETE FROM refresh_sessions WHERE token_hash IN (?)', [hashes]);
+    }
+    server.close();
+    await pool.end();
+  }
+
+  // Summary
+  console.log('\n======================================================');
+  const passedCount = results.filter((r) => r.passed).length;
+  const totalCount = results.length;
+  console.log(`📊 TEST RESULTS: ${passedCount}/${totalCount} PASSED`);
+  console.log('======================================================\n');
+
+  if (passedCount !== totalCount) {
+    process.exit(1);
+  } else {
+    process.exit(0);
+  }
+}
+
+run().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
