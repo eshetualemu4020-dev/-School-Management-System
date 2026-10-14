@@ -679,6 +679,10 @@ export default function AdminDashboard({ user, onLogout }: AdminDashboardProps) 
       setActionMessage({ text: 'Select a student status.', type: 'error' });
       return;
     }
+    if (newStatus === 'transferred' && !destinationSchool.trim()) {
+      setActionMessage({ text: 'Enter the destination school for this transfer.', type: 'error' });
+      return;
+    }
     if (newStatus === 'active' && statusModalStudent?.student_status !== 'active' && !statusSectionId) {
       setActionMessage({ text: 'Select a section placement before activating this student.', type: 'error' });
       return;
@@ -5342,10 +5346,13 @@ export default function AdminDashboard({ user, onLogout }: AdminDashboardProps) 
 
               {newStatus === 'transferred' && (
                 <div className="form-field">
-                  <label>Destination School</label>
+                  <label htmlFor="student-transfer-destination">Destination School *</label>
                   <input
+                    id="student-transfer-destination"
                     type="text"
                     placeholder="Enter destination school"
+                    maxLength={190}
+                    required
                     value={destinationSchool}
                     onChange={(e) => setDestinationSchool(e.target.value)}
                   />

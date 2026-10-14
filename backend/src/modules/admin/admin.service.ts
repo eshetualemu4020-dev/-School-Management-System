@@ -123,6 +123,12 @@ export class AdminService {
     if (payload.newStatus === 'active' && !payload.sectionId) {
       throw new AppError('Select a section when activating a student.', 400, 'SECTION_REQUIRED');
     }
+    if (payload.newStatus === 'transferred') {
+      const destinationSchool = payload.destinationSchool?.trim() || '';
+      if (!destinationSchool) throw new AppError('Destination school is required for a student transfer.', 400, 'DESTINATION_SCHOOL_REQUIRED');
+      if (destinationSchool.length > 190) throw new AppError('Destination school must be 190 characters or fewer.', 400, 'DESTINATION_SCHOOL_TOO_LONG');
+      payload.destinationSchool = destinationSchool;
+    }
     const effectiveDate = /^\d{4}-\d{2}-\d{2}$/.test(payload.effectiveDate)
       ? new Date(`${payload.effectiveDate}T00:00:00Z`)
       : null;
