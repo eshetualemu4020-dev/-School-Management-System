@@ -1,4 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react'
+import { createPortal } from 'react-dom'
 import './App.css'
 import TeacherDashboard from './components/TeacherDashboard'
 import AdminDashboard from './components/AdminDashboard'
@@ -6,6 +7,7 @@ import StudentDashboard from './components/StudentDashboard'
 import LibrarianDashboard from './components/LibrarianDashboard'
 import RegistrarDashboard from './components/RegistrarDashboard'
 import ParentDashboard from './components/ParentDashboard'
+import NotificationCenter from './components/NotificationCenter'
 import { api } from './api/client'
 
 type AuthMode = 'signin' | 'register'
@@ -43,6 +45,8 @@ type AuthenticatedUser = {
   email: string
   role: string
   permissions: string[]
+  staffName?: string
+  mustChangePassword?: boolean
 }
 
 const defaultPublicHome: PublicHome = {
@@ -88,12 +92,15 @@ export default function App() {
   const [authMode, setAuthMode] = useState<AuthMode>('signin')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [loginRole, setLoginRole] = useState<'student' | 'guardian' | 'teacher' | 'registrar' | 'librarian' | 'administrator'>('student')
   const [rememberMe, setRememberMe] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [successMessage, setSuccessMessage] = useState<string | null>(null)
   const [showPassword, setShowPassword] = useState(false)
   const [authenticatedUser, setAuthenticatedUser] = useState<AuthenticatedUser | null>(null)
+  const [dashboardTheme, setDashboardTheme] = useState<'light' | 'dark'>('light')
+  const [themeToggleAnchor, setThemeToggleAnchor] = useState<HTMLElement | null>(null)
   const [publicHome, setPublicHome] = useState<PublicHome | null>(null)
   const [regRole, setRegRole] = useState<'student' | 'guardian'>('student')
   const [regFirstName, setRegFirstName] = useState('')
@@ -102,7 +109,7 @@ export default function App() {
   const [regPhone, setRegPhone] = useState('')
   const [regPassword, setRegPassword] = useState('')
   const [regConfirmPassword, setRegConfirmPassword] = useState('')
-  const [regGrade, setRegGrade] = useState('11')
+  const [regGrade, setRegGrade] = useState('9')
   const [regStream, setRegStream] = useState('Natural Science')
   const [regIdNumber, setRegIdNumber] = useState('')
   const [forgotModalOpen, setForgotModalOpen] = useState(false)
@@ -117,6 +124,29 @@ export default function App() {
   const [resetError, setResetError] = useState<string | null>(null)
   const [resetSubmitted, setResetSubmitted] = useState(false)
   const [resetLoading, setResetLoading] = useState(false)
+  const [requiredCurrentPassword, setRequiredCurrentPassword] = useState('')
+  const [requiredNewPassword, setRequiredNewPassword] = useState('')
+  const [requiredConfirmPassword, setRequiredConfirmPassword] = useState('')
+  const [requiredPasswordError, setRequiredPasswordError] = useState<string | null>(null)
+  const [requiredPasswordLoading, setRequiredPasswordLoading] = useState(false)
+
+  // Two-Factor Authentication (MFA) state
+  const [showMfaModal, setShowMfaModal] = useState(false)
+  const [mfaTempToken, setMfaTempToken] = useState<string | null>(null)
+  const [mfaCode, setMfaCode] = useState('')
+  const [mfaError, setMfaError] = useState<string | null>(null)
+  const [mfaLoading, setMfaLoading] = useState(false)
+
+  // Browser Path Tracking for Protected Routes & Shared Pages
+  const [currentPath, setCurrentPath] = useState<string>(() => window.location.pathname)
+
+  useEffect(() => {
+    const onPopState = () => setCurrentPath(window.location.pathname)
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [])
+
+
 
   useEffect(() => {
     const loadHome = async () => {
@@ -132,6 +162,26 @@ export default function App() {
   }, [])
 
   useEffect(() => {
+    if (!authenticatedUser) return
+    const savedTheme = localStorage.getItem(`hspsms-theme:${authenticatedUser.id}`)
+    setDashboardTheme(savedTheme === 'dark' ? 'dark' : 'light')
+
+    const updateAnchor = () => {
+      const anchor = document.querySelector<HTMLElement>('.user-profile-badge, .sh-user-badge')
+      setThemeToggleAnchor((prev) => (prev === anchor ? prev : anchor))
+    }
+
+    updateAnchor()
+    const observer = new MutationObserver(updateAnchor)
+    observer.observe(document.body, { childList: true, subtree: true })
+
+    return () => {
+      observer.disconnect()
+      setThemeToggleAnchor(null)
+    }
+  }, [authenticatedUser?.id])
+
+  useEffect(() => {
     const tokenFromLink = new URLSearchParams(window.location.search).get('resetToken')
     if (tokenFromLink) {
       setResetToken(tokenFromLink)
@@ -145,7 +195,9 @@ export default function App() {
           username: user.username,
           email: user.email,
           role: user.roles?.[0] || user.role || 'student',
-          permissions: user.permissions || []
+          permissions: user.permissions || [],
+          staffName: user.staff?.fullName || user.staffName || undefined,
+          mustChangePassword: Boolean((user as any).mustChangePassword)
         })
       }
     }).catch((error: any) => {
@@ -155,20 +207,47 @@ export default function App() {
     })
   }, [])
 
+
   const handleLogin = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     setIsLoading(true)
     setErrorMessage(null)
 
     try {
-      const result = await api.login(username.trim(), password, rememberMe)
+      const result = await api.login(username.trim(), password, rememberMe, loginRole)
+
+      if (result.mfaRequired && result.tempToken) {
+        setMfaTempToken(result.tempToken)
+        setShowMfaModal(true)
+        setMfaError(null)
+        setMfaCode('')
+        return
+      }
+
+      // The account's real role comes from the database and always wins. The role
+      // selector is only a convenience; a correct password must never be refused
+      // because it was left on the wrong option.
+      const accountRoles: string[] = result.user.roles || []
+      const primaryRole = accountRoles[0] || loginRole
+      const expectedRole = loginRole === 'guardian' ? 'parent' : loginRole
+      const hasExpectedRole = accountRoles.some(
+        (r) => r === expectedRole || (expectedRole === 'parent' && r === 'guardian')
+      )
+      if (accountRoles.length > 0 && !hasExpectedRole) {
+        setErrorMessage(
+          (result as any).roleWarning ||
+            `You are signed in as ${primaryRole}. The selected role does not match your account.`
+        )
+      }
 
       setAuthenticatedUser({
         id: result.user.id,
         username: result.user.username,
         email: result.user.email,
-        role: result.user.roles?.[0] || 'student',
-        permissions: result.user.permissions || []
+        role: primaryRole,
+        permissions: result.user.permissions || [],
+        staffName: result.user.staff?.fullName || undefined,
+        mustChangePassword: Boolean(result.mustChangePassword ?? (result.user as any)?.mustChangePassword)
       })
 
       setUsername('')
@@ -177,6 +256,36 @@ export default function App() {
       setErrorMessage(error.message || 'Unable to sign in.')
     } finally {
       setIsLoading(false)
+    }
+  }
+
+  const handleMfaSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!mfaTempToken || !mfaCode.trim()) return
+
+    setMfaLoading(true)
+    setMfaError(null)
+
+    try {
+      const result = await api.authenticate2FA(mfaTempToken, mfaCode.trim(), rememberMe)
+      setAuthenticatedUser({
+        id: result.user.id,
+        username: result.user.username,
+        email: result.user.email,
+        role: result.user.roles?.[0] || 'student',
+        permissions: result.user.permissions || [],
+        staffName: result.user.staff?.fullName || undefined,
+        mustChangePassword: Boolean((result as any).mustChangePassword ?? (result.user as any)?.mustChangePassword)
+      })
+      setShowMfaModal(false)
+      setMfaTempToken(null)
+      setMfaCode('')
+      setUsername('')
+      setPassword('')
+    } catch (error: any) {
+      setMfaError(error.message || 'Invalid authentication code. Please try again.')
+    } finally {
+      setMfaLoading(false)
     }
   }
 
@@ -254,9 +363,38 @@ export default function App() {
   const handleLogout = () => {
     void api.logout().catch(() => undefined)
     setAuthenticatedUser(null)
+    setRequiredCurrentPassword('')
+    setRequiredNewPassword('')
+    setRequiredConfirmPassword('')
+    setRequiredPasswordError(null)
     setErrorMessage(null)
     setSuccessMessage(null)
     setAuthMode('signin')
+  }
+
+  const handleRequiredPasswordChange = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setRequiredPasswordError(null)
+    if (requiredNewPassword !== requiredConfirmPassword) {
+      setRequiredPasswordError('The new passwords do not match.')
+      return
+    }
+    if (requiredNewPassword.length < 8 || !/[A-Z]/.test(requiredNewPassword) || !/[a-z]/.test(requiredNewPassword) || !/[0-9]/.test(requiredNewPassword)) {
+      setRequiredPasswordError('Use at least 8 characters with an uppercase letter, a lowercase letter, and a number.')
+      return
+    }
+    setRequiredPasswordLoading(true)
+    try {
+      await api.changePassword(requiredCurrentPassword, requiredNewPassword)
+      setAuthenticatedUser((current) => current ? { ...current, mustChangePassword: false } : current)
+      setRequiredCurrentPassword('')
+      setRequiredNewPassword('')
+      setRequiredConfirmPassword('')
+    } catch (error: any) {
+      setRequiredPasswordError(error.message || 'Unable to change the password.')
+    } finally {
+      setRequiredPasswordLoading(false)
+    }
   }
 
   const handleResetPassword = async (event: FormEvent<HTMLFormElement>) => {
@@ -282,11 +420,185 @@ export default function App() {
 
   const home = publicHome || defaultPublicHome
 
+  // 1. Shared Page: 404 Not Found (/404)
+  if (currentPath === '/404') {
+    return (
+      <main className="auth-access-message" role="status" style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#F8FAFC', padding: '24px', textAlign: 'center' }}>
+        <div style={{ fontSize: '56px', marginBottom: '16px' }}>🔍</div>
+        <div style={{ display: 'inline-block', padding: '4px 12px', background: '#FEE2E2', color: '#DC2626', borderRadius: '999px', fontSize: '12px', fontWeight: 700, marginBottom: '12px' }}>
+          404 NOT FOUND
+        </div>
+        <h1 style={{ fontSize: '24px', fontWeight: 800, color: '#1E293B', marginBottom: '8px' }}>Page Not Found</h1>
+        <p style={{ fontSize: '14px', color: '#64748B', maxWidth: '440px', marginBottom: '20px' }}>
+          The requested URL <code>{currentPath}</code> does not exist on this school management portal.
+        </p>
+        <button
+          type="button"
+          className="submit-btn"
+          style={{ maxWidth: '220px' }}
+          onClick={() => {
+            const dest = authenticatedUser ? (authenticatedUser.role === 'teacher' ? '/teacher/dashboard' : '/') : '/';
+            window.history.pushState(null, '', dest);
+            setCurrentPath(dest);
+          }}
+        >
+          Return to Portal
+        </button>
+      </main>
+    )
+  }
+
+  // 2. Shared Page: Unauthorized 403 (/unauthorized)
+  if (currentPath === '/unauthorized') {
+    return (
+      <main className="auth-access-message" role="status" style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#F8FAFC', padding: '24px', textAlign: 'center' }}>
+        <div style={{ fontSize: '56px', marginBottom: '16px' }}>🚫</div>
+        <div style={{ display: 'inline-block', padding: '4px 12px', background: '#FEE2E2', color: '#DC2626', borderRadius: '999px', fontSize: '12px', fontWeight: 700, marginBottom: '12px' }}>
+          403 UNAUTHORIZED
+        </div>
+        <h1 style={{ fontSize: '24px', fontWeight: 800, color: '#1E293B', marginBottom: '8px' }}>Access Denied</h1>
+        <p style={{ fontSize: '14px', color: '#64748B', maxWidth: '440px', marginBottom: '20px' }}>
+          {authenticatedUser
+            ? <>Account <strong>@{authenticatedUser.username}</strong> with role <code>{authenticatedUser.role}</code> does not have authorization to view this resource.</>
+            : <>You must be signed in with an authorized faculty or staff account to access this page.</>}
+        </p>
+        <div style={{ display: 'flex', gap: '10px' }}>
+          {authenticatedUser && (
+            <button
+              type="button"
+              className="submit-btn"
+              style={{ maxWidth: '200px' }}
+              onClick={() => {
+                const dest = authenticatedUser.role === 'teacher' ? '/teacher/dashboard' : '/';
+                window.history.pushState(null, '', dest);
+                setCurrentPath(dest);
+              }}
+            >
+              My Dashboard
+            </button>
+          )}
+          <button type="button" className="submit-btn" style={{ maxWidth: '160px', background: '#64748B' }} onClick={handleLogout}>
+            {authenticatedUser ? 'Sign Out' : 'Sign In'}
+          </button>
+        </div>
+      </main>
+    )
+  }
+
+  // 3. Teacher Route Protection Guard (/teacher/*) for Authenticated Non-Teachers
+  if (authenticatedUser && currentPath.startsWith('/teacher') && authenticatedUser.role.toLowerCase() !== 'teacher') {
+    return (
+      <main className="auth-access-message" role="status" style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#F8FAFC', padding: '24px', textAlign: 'center' }}>
+        <div style={{ fontSize: '56px', marginBottom: '16px' }}>🚫</div>
+        <div style={{ display: 'inline-block', padding: '4px 12px', background: '#FEE2E2', color: '#DC2626', borderRadius: '999px', fontSize: '12px', fontWeight: 700, marginBottom: '12px' }}>
+          403 FORBIDDEN
+        </div>
+        <h1 style={{ fontSize: '24px', fontWeight: 800, color: '#1E293B', marginBottom: '8px' }}>Teacher Portal Access Restricted</h1>
+        <p style={{ fontSize: '14px', color: '#64748B', maxWidth: '440px', marginBottom: '20px' }}>
+          Account <strong>@{authenticatedUser.username}</strong> is signed in as <code>{authenticatedUser.role}</code>. The requested teacher route <code>{currentPath}</code> is strictly restricted to assigned teaching faculty.
+        </p>
+        <div style={{ display: 'flex', gap: '10px' }}>
+          <button
+            type="button"
+            className="submit-btn"
+            style={{ maxWidth: '200px' }}
+            onClick={() => {
+              window.history.pushState(null, '', '/');
+              setCurrentPath('/');
+            }}
+          >
+            Go to My Dashboard
+          </button>
+          <button type="button" className="submit-btn" style={{ maxWidth: '160px', background: '#64748B' }} onClick={handleLogout}>
+            Sign Out
+          </button>
+        </div>
+      </main>
+    )
+  }
+
+  // 3b. Student Route Protection Guard (/student/*) for Authenticated Non-Students
+  if (authenticatedUser && currentPath.startsWith('/student') && authenticatedUser.role.toLowerCase() !== 'student') {
+    return (
+      <main className="auth-access-message" role="status" style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#F8FAFC', padding: '24px', textAlign: 'center' }}>
+        <div style={{ fontSize: '56px', marginBottom: '16px' }}>🚫</div>
+        <div style={{ display: 'inline-block', padding: '4px 12px', background: '#FEE2E2', color: '#DC2626', borderRadius: '999px', fontSize: '12px', fontWeight: 700, marginBottom: '12px' }}>
+          403 FORBIDDEN
+        </div>
+        <h1 style={{ fontSize: '24px', fontWeight: 800, color: '#1E293B', marginBottom: '8px' }}>Student Portal Access Restricted</h1>
+        <p style={{ fontSize: '14px', color: '#64748B', maxWidth: '440px', marginBottom: '20px' }}>
+          Account <strong>@{authenticatedUser.username}</strong> is signed in as <code>{authenticatedUser.role}</code>. The requested student route <code>{currentPath}</code> is strictly restricted to enrolled students.
+        </p>
+        <div style={{ display: 'flex', gap: '10px' }}>
+          <button
+            type="button"
+            className="submit-btn"
+            style={{ maxWidth: '200px' }}
+            onClick={() => {
+              window.history.pushState(null, '', '/');
+              setCurrentPath('/');
+            }}
+          >
+            Go to My Dashboard
+          </button>
+          <button type="button" className="submit-btn" style={{ maxWidth: '160px', background: '#64748B' }} onClick={handleLogout}>
+            Sign Out
+          </button>
+        </div>
+      </main>
+    )
+  }
+
+  // 4. Shared Page: Forced or Voluntary Password Change (/change-password)
+  if (authenticatedUser && (authenticatedUser.mustChangePassword || currentPath === '/change-password')) {
+    return (
+      <main className="auth-access-message" style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#F8FAFC', padding: '24px' }}>
+        <form onSubmit={handleRequiredPasswordChange} style={{ width: 'min(100%, 440px)', padding: '32px', borderRadius: '16px', background: '#fff', boxShadow: '0 12px 36px rgba(15, 23, 42, .12)' }}>
+          <h1 style={{ margin: '0 0 8px', color: '#1E3A5F', fontSize: '24px' }}>
+            {authenticatedUser.mustChangePassword ? 'Set your new password' : 'Change account password'}
+          </h1>
+          <p style={{ margin: '0 0 24px', color: '#64748B' }}>
+            {authenticatedUser.mustChangePassword
+              ? 'For account security, change your temporary password before continuing.'
+              : 'Enter your current password and choose a secure new password.'}
+          </p>
+          {requiredPasswordError && <div role="alert" style={{ marginBottom: '16px', color: '#B91C1C' }}>{requiredPasswordError}</div>}
+          <label style={{ display: 'block', marginBottom: '16px', color: '#334155' }}>Current password
+            <input required type="password" autoComplete="current-password" value={requiredCurrentPassword} onChange={(event) => setRequiredCurrentPassword(event.target.value)} style={{ display: 'block', width: '100%', marginTop: '6px', padding: '11px 12px', border: '1px solid #CBD5E1', borderRadius: '8px' }} />
+          </label>
+          <label style={{ display: 'block', marginBottom: '16px', color: '#334155' }}>New password
+            <input required type="password" autoComplete="new-password" value={requiredNewPassword} onChange={(event) => setRequiredNewPassword(event.target.value)} style={{ display: 'block', width: '100%', marginTop: '6px', padding: '11px 12px', border: '1px solid #CBD5E1', borderRadius: '8px' }} />
+          </label>
+          <label style={{ display: 'block', marginBottom: '20px', color: '#334155' }}>Confirm new password
+            <input required type="password" autoComplete="new-password" value={requiredConfirmPassword} onChange={(event) => setRequiredConfirmPassword(event.target.value)} style={{ display: 'block', width: '100%', marginTop: '6px', padding: '11px 12px', border: '1px solid #CBD5E1', borderRadius: '8px' }} />
+          </label>
+          <button type="submit" disabled={requiredPasswordLoading} className="submit-btn" style={{ width: '100%' }}>{requiredPasswordLoading ? 'Updating…' : 'Update password'}</button>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '16px' }}>
+            {!authenticatedUser.mustChangePassword && (
+              <button
+                type="button"
+                onClick={() => {
+                  const dest = authenticatedUser.role === 'teacher' ? '/teacher/dashboard' : '/';
+                  window.history.pushState(null, '', dest);
+                  setCurrentPath(dest);
+                }}
+                style={{ border: 0, background: 'transparent', color: '#2563EB', cursor: 'pointer', fontSize: '14px' }}
+              >
+                &larr; Back to Dashboard
+              </button>
+            )}
+            <button type="button" onClick={handleLogout} style={{ border: 0, background: 'transparent', color: '#475569', cursor: 'pointer', fontSize: '14px' }}>Sign out</button>
+          </div>
+        </form>
+      </main>
+    )
+  }
+
   if (authenticatedUser) {
     const role = authenticatedUser.role.toLowerCase()
 
     const Dashboard =
-      role === 'administrator' || role === 'system_admin'
+      role === 'administrator' || role === 'system_admin' || role === 'principal' || role === 'accountant'
         ? AdminDashboard
         : role === 'teacher'
           ? TeacherDashboard
@@ -302,35 +614,50 @@ export default function App() {
 
     if (!Dashboard) {
       return (
-        <main className="auth-access-message" role="status">
-          <h1>No dashboard is assigned to this account.</h1>
-          <p>Contact the school administrator to review your access.</p>
-          <button type="button" className="submit-btn" onClick={handleLogout}>Sign out</button>
+        <main className="auth-access-message" role="status" style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#F8FAFC', padding: '24px', textAlign: 'center' }}>
+          <div style={{ fontSize: '48px', marginBottom: '16px' }}>🚫</div>
+          <h1 style={{ fontSize: '24px', fontWeight: 700, color: '#1E293B', marginBottom: '8px' }}>Access Denied (/unauthorized)</h1>
+          <p style={{ fontSize: '14px', color: '#64748B', maxWidth: '440px', marginBottom: '20px' }}>
+            Account <strong>@{authenticatedUser.username}</strong> with role <code>{authenticatedUser.role}</code> does not have an active portal dashboard assigned. Please contact the school administrator.
+          </p>
+          <button type="button" className="submit-btn" style={{ maxWidth: '200px' }} onClick={handleLogout}>Sign out to Login</button>
         </main>
       )
     }
 
-    if (Dashboard === AdminDashboard) {
-      return <AdminDashboard user={{ username: authenticatedUser.username, role: authenticatedUser.role, permissions: authenticatedUser.permissions }} onLogout={handleLogout} />
-    }
+    const dashboardUser = { username: authenticatedUser.username, role: authenticatedUser.role, permissions: authenticatedUser.permissions, staffName: authenticatedUser.staffName }
+    const dashboard = Dashboard === AdminDashboard
+      ? <AdminDashboard user={dashboardUser} onLogout={handleLogout} />
+      : Dashboard === TeacherDashboard
+        ? <TeacherDashboard teacherName={authenticatedUser.username} teacherUsername={authenticatedUser.username} onLogout={handleLogout} />
+        : Dashboard === StudentDashboard
+          ? <StudentDashboard user={dashboardUser} onLogout={handleLogout} />
+          : Dashboard === LibrarianDashboard
+            ? <LibrarianDashboard user={dashboardUser} onLogout={handleLogout} />
+            : Dashboard === RegistrarDashboard
+              ? <RegistrarDashboard user={dashboardUser} onLogout={handleLogout} />
+              : <ParentDashboard user={dashboardUser} onLogout={handleLogout} />
 
-    if (Dashboard === TeacherDashboard) {
-      return <TeacherDashboard teacherName={authenticatedUser.username} teacherUsername={authenticatedUser.username} onLogout={handleLogout} />
-    }
-
-    if (Dashboard === StudentDashboard) {
-      return <StudentDashboard user={{ username: authenticatedUser.username, role: authenticatedUser.role, permissions: authenticatedUser.permissions }} onLogout={handleLogout} />
-    }
-
-    if (Dashboard === LibrarianDashboard) {
-      return <LibrarianDashboard user={{ username: authenticatedUser.username, role: authenticatedUser.role, permissions: authenticatedUser.permissions }} onLogout={handleLogout} />
-    }
-
-    if (Dashboard === RegistrarDashboard) {
-      return <RegistrarDashboard user={{ username: authenticatedUser.username, role: authenticatedUser.role, permissions: authenticatedUser.permissions }} onLogout={handleLogout} />
-    }
-
-    return <ParentDashboard user={{ username: authenticatedUser.username, role: authenticatedUser.role, permissions: authenticatedUser.permissions }} onLogout={handleLogout} />
+    return (
+      <div className="dashboard-theme-root" data-dashboard-theme={dashboardTheme}>
+        {dashboard}
+        {/* Dashboards with their own topbar bell icon (Admin & Teacher) do not use the floating widget. */}
+        {Dashboard !== AdminDashboard && Dashboard !== TeacherDashboard && <NotificationCenter />}
+        {themeToggleAnchor && createPortal(<button
+          type="button"
+          className="dashboard-theme-toggle"
+          aria-label={`Switch to ${dashboardTheme === 'dark' ? 'light' : 'dark'} theme`}
+          aria-pressed={dashboardTheme === 'dark'}
+          onClick={() => {
+            const nextTheme = dashboardTheme === 'dark' ? 'light' : 'dark'
+            setDashboardTheme(nextTheme)
+            localStorage.setItem(`hspsms-theme:${authenticatedUser.id}`, nextTheme)
+          }}
+        >
+          <span aria-hidden="true">{dashboardTheme === 'dark' ? '☀' : '☾'}</span>
+        </button>, themeToggleAnchor)}
+      </div>
+    )
   }
 
   return (
@@ -674,7 +1001,71 @@ export default function App() {
                   </div>
                 )}
 
-                {authMode === 'signin' ? (
+                {showMfaModal ? (
+                  <div className="mfa-challenge-panel">
+                    <div className="form-header">
+                      <h2>Two-Factor Verification</h2>
+                      <p>Enter the 6-digit code generated by your mobile authenticator app, or an 8-character recovery backup code.</p>
+                    </div>
+
+                    {mfaError && (
+                      <div className="alert-banner alert-danger" role="alert">
+                        <svg className="alert-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                        <span>{mfaError}</span>
+                      </div>
+                    )}
+
+                    <form className="login-form" onSubmit={handleMfaSubmit}>
+                      <div className="input-group">
+                        <label className="input-label" htmlFor="mfa-code">
+                          Verification or Backup Code
+                        </label>
+                        <div className="input-wrapper">
+                          <svg className="input-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                          </svg>
+                          <input
+                            id="mfa-code"
+                            type="text"
+                            autoFocus
+                            autoComplete="one-time-code"
+                            className="form-input"
+                            style={{ letterSpacing: '2px', fontFamily: 'monospace', fontSize: '1.2rem', textAlign: 'center' }}
+                            placeholder="123456"
+                            value={mfaCode}
+                            onChange={(e) => setMfaCode(e.target.value.toUpperCase())}
+                            required
+                          />
+                        </div>
+                      </div>
+
+                      <button
+                        type="submit"
+                        className="submit-btn"
+                        disabled={mfaLoading || !mfaCode.trim()}
+                        style={{ marginTop: '16px' }}
+                      >
+                        {mfaLoading ? 'Verifying...' : 'Verify & Continue'}
+                      </button>
+
+                      <button
+                        type="button"
+                        className="text-btn"
+                        style={{ marginTop: '12px', width: '100%', textAlign: 'center', background: 'none', border: 'none', color: 'var(--primary-color, #2563eb)', cursor: 'pointer', padding: '8px' }}
+                        onClick={() => {
+                          setShowMfaModal(false)
+                          setMfaTempToken(null)
+                          setMfaCode('')
+                          setMfaError(null)
+                        }}
+                      >
+                        ← Back to standard sign in
+                      </button>
+                    </form>
+                  </div>
+                ) : authMode === 'signin' ? (
                   <>
                     <div className="form-header">
                       <h2>Sign in to Account</h2>
@@ -682,6 +1073,25 @@ export default function App() {
                     </div>
 
                     <form className="login-form" onSubmit={handleLogin}>
+                      <div className="input-group">
+                        <label className="input-label" htmlFor="loginRole">
+                          Sign in as
+                        </label>
+                        <select
+                          id="loginRole"
+                          className="form-select"
+                          value={loginRole}
+                          onChange={(e) => setLoginRole(e.target.value as any)}
+                        >
+                          <option value="student">Student</option>
+                          <option value="guardian">Parent / Guardian</option>
+                          <option value="teacher">Teacher / Faculty</option>
+                          <option value="registrar">Registrar</option>
+                          <option value="librarian">Librarian</option>
+                          <option value="administrator">Administrator</option>
+                        </select>
+                      </div>
+
                       <div className="input-group">
                         <label className="input-label" htmlFor="username">
                           Username or Email

@@ -5,6 +5,20 @@ export const isEmailDeliveryConfigured = (): boolean => Boolean(
   env.SMTP_HOST && env.SMTP_FROM
 );
 
+export async function sendNotificationEmail(email: string, subject: string, text: string, html?: string): Promise<void> {
+  if (!isEmailDeliveryConfigured()) throw new Error('Email delivery is not configured.');
+  const transport = nodemailer.createTransport({
+    host: env.SMTP_HOST,
+    port: env.SMTP_PORT,
+    secure: env.SMTP_SECURE,
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 10_000,
+    auth: env.SMTP_USER ? { user: env.SMTP_USER, pass: env.SMTP_PASSWORD } : undefined
+  });
+  await transport.sendMail({ from: env.SMTP_FROM, to: email, subject, text, ...(html ? { html } : {}) });
+}
+
 export async function sendPasswordResetEmail(email: string, token: string): Promise<void> {
   if (!isEmailDeliveryConfigured()) {
     throw new Error('Password recovery email is not configured.');

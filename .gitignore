@@ -31,3 +31,7 @@ yarn-error.log*
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Runtime uploads and backups
+backend/private_uploads/
+backend/storage/

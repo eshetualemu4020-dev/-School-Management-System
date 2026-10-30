@@ -97,10 +97,13 @@ export class PublicController {
         `SELECT COUNT(*) AS total_teachers FROM staff WHERE status = 'active' AND staff_type = 'teacher'`
       );
       const [announcementRows] = await pool.query<RowDataPacket[]>(
-        `SELECT id, title, body, published_at 
-         FROM announcements
-         WHERE status = 'published' AND (expires_at IS NULL OR expires_at > NOW())
-         ORDER BY published_at DESC, id DESC
+        `SELECT DISTINCT a.id, a.title, a.body, a.published_at
+         FROM announcements a
+         WHERE a.status = 'published' AND a.deleted_at IS NULL AND (a.expires_at IS NULL OR a.expires_at > NOW(3))
+           AND (NOT EXISTS (SELECT 1 FROM announcement_targets any_target WHERE any_target.announcement_id = a.id)
+             OR EXISTS (SELECT 1 FROM announcement_targets target
+               WHERE target.announcement_id = a.id AND target.target_type = 'all'))
+         ORDER BY a.published_at DESC, a.id DESC
          LIMIT 4`
       );
 

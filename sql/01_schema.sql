@@ -278,7 +278,7 @@ CREATE TABLE `grades` (
   `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'Surrogate primary key',
   `grade_level` TINYINT UNSIGNED NOT NULL COMMENT 'Numeric level, 9 to 12 in the baseline',
   `display_name` VARCHAR(40) NOT NULL COMMENT 'Display name, e.g. Grade 9',
-  `has_streams` TINYINT(1) NOT NULL DEFAULT 0 COMMENT '1 = sections choose Natural or Social Science (Grades 11-12)',
+  `has_streams` TINYINT(1) NOT NULL DEFAULT 0 COMMENT '1 = sections choose Natural or Social Science',
   `is_active` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '0 = hidden from new setups',
   `created_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT 'Row creation time (UTC)',
   `updated_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT 'Last change time (UTC)',
@@ -335,6 +335,7 @@ CREATE TABLE `subjects` (
   `code` VARCHAR(20) NOT NULL COMMENT 'Short code, e.g. MATH',
   `name` VARCHAR(100) NOT NULL COMMENT 'English name',
   `name_am` VARCHAR(100) NULL COMMENT 'Amharic name',
+  `description` VARCHAR(500) NULL COMMENT 'Optional subject description',
   `status` ENUM('active','inactive') NOT NULL DEFAULT 'active' COMMENT 'Availability',
   `created_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT 'Row creation time (UTC)',
   `updated_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT 'Last change time (UTC)',
@@ -347,12 +348,15 @@ CREATE TABLE `grade_subjects` (
   `grade_id` BIGINT UNSIGNED NOT NULL COMMENT 'Grade',
   `subject_id` BIGINT UNSIGNED NOT NULL COMMENT 'Subject',
   `stream` ENUM('all','natural_science','social_science') NOT NULL DEFAULT 'all' COMMENT 'Stream the subject applies to',
+  `academic_year_id` BIGINT UNSIGNED NULL COMMENT 'NULL means all academic years',
   `is_compulsory` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '1 = every student in scope takes it',
   `periods_per_week` TINYINT UNSIGNED NULL COMMENT 'Planned weekly periods',
   `created_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT 'Row creation time (UTC)',
   `updated_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT 'Last change time (UTC)',
+  `academic_year_scope` BIGINT UNSIGNED GENERATED ALWAYS AS (COALESCE(`academic_year_id`, 0)) STORED COMMENT 'Generated scope key for unique global or year-specific mappings',
   PRIMARY KEY (`id`),
-  UNIQUE KEY `uq_grade_subjects` (`grade_id`, `subject_id`, `stream`),
+  UNIQUE KEY `uq_grade_subjects` (`grade_id`, `subject_id`, `stream`, `academic_year_scope`),
+  KEY `ix_grade_subjects_year` (`academic_year_id`),
   KEY `ix_grade_subjects_subject` (`subject_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Which subjects apply to which grade and stream (grade applicability).';
 
@@ -1211,6 +1215,7 @@ ALTER TABLE `calendar_events` ADD CONSTRAINT `fk_calendar_events_academic_year_i
 ALTER TABLE `calendar_events` ADD CONSTRAINT `fk_calendar_events_created_by` FOREIGN KEY (`created_by`) REFERENCES `users` (`id`);
 ALTER TABLE `grade_subjects` ADD CONSTRAINT `fk_grade_subjects_grade_id` FOREIGN KEY (`grade_id`) REFERENCES `grades` (`id`);
 ALTER TABLE `grade_subjects` ADD CONSTRAINT `fk_grade_subjects_subject_id` FOREIGN KEY (`subject_id`) REFERENCES `subjects` (`id`);
+ALTER TABLE `grade_subjects` ADD CONSTRAINT `fk_grade_subjects_academic_year_id` FOREIGN KEY (`academic_year_id`) REFERENCES `academic_years` (`id`);
 ALTER TABLE `sections` ADD CONSTRAINT `fk_sections_grade_id` FOREIGN KEY (`grade_id`) REFERENCES `grades` (`id`);
 ALTER TABLE `sections` ADD CONSTRAINT `fk_sections_academic_year_id` FOREIGN KEY (`academic_year_id`) REFERENCES `academic_years` (`id`);
 ALTER TABLE `sections` ADD CONSTRAINT `fk_sections_homeroom_staff_id` FOREIGN KEY (`homeroom_staff_id`) REFERENCES `staff` (`id`);

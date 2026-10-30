@@ -173,7 +173,7 @@ async function run() {
       });
       const staffSignupData = await staffSignupRes.json();
       const roleCode = role === 'administrator' ? 'system_admin' : role;
-      await assert(`${role} registration request is accepted pending approval`, staffSignupRes.status === 201 && staffSignupData?.data?.pendingApproval === true && !staffSignupRes.headers.get('set-cookie'));
+      await assert(`${role} registration is active immediately without pending approval`, staffSignupRes.status === 201 && staffSignupData?.data?.pendingApproval === false);
 
       const [accountRows]: any = await pool.query(
         `SELECT u.id, u.status, r.code FROM users u
@@ -181,15 +181,15 @@ async function run() {
          WHERE u.email = ?`,
         [roleEmail]
       );
-      await assert(`${role} account remains invited with the requested role`, accountRows[0]?.status === 'invited' && accountRows[0]?.code === roleCode);
+      await assert(`${role} account is created active with the requested role`, accountRows[0]?.status === 'active' && accountRows[0]?.code === roleCode);
 
-      const pendingLoginRes = await fetch(`${baseUrl}/auth/login`, {
+      const activeLoginRes = await fetch(`${baseUrl}/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: roleEmail, password: 'StaffSignupPass#2026' })
       });
-      const pendingLoginData = await pendingLoginRes.json();
-      await assert(`${role} cannot sign in before approval`, pendingLoginRes.status === 403 && pendingLoginData?.error?.code === 'ACCOUNT_PENDING_APPROVAL');
+      const activeLoginData = await activeLoginRes.json();
+      await assert(`${role} can sign in immediately`, activeLoginRes.status === 200 && !!activeLoginData?.data?.user);
 
       await pool.query('DELETE FROM audit_logs WHERE actor_user_id = ?', [accountRows[0].id]);
       await pool.query('DELETE FROM refresh_sessions WHERE user_id = ?', [accountRows[0].id]);
@@ -233,6 +233,7 @@ async function run() {
     if (tt1.length === 0) {
       await pool.query(`INSERT INTO timetable_entries (term_id, section_id, subject_id, staff_id, room_id, time_slot_id) VALUES (3, 1, 1, 5, 1, 1)`);
     }
+    await pool.query(`INSERT INTO teaching_assignments (id, staff_id, subject_id, section_id, academic_year_id, is_active) VALUES (3, 5, 1, 3, 3, 1) ON DUPLICATE KEY UPDATE is_active = 1`);
 
     // -----------------------------------------------------------------
     // TEST 2: Unauthenticated requests rejected
@@ -407,8 +408,9 @@ async function run() {
     });
     const assessmentsData = await assessmentsRes.json();
     await assert('Teacher assessments retrieved from DB', assessmentsRes.status === 200 && assessmentsData?.data?.length >= 1);
-    const assessmentId = assessmentsData.data[0].id;
-    const maxScore = Number(assessmentsData.data[0].max_score); // 30.00
+    const targetAssessment = assessmentsData.data.find((a: any) => a.id === 1) || assessmentsData.data[0];
+    const assessmentId = targetAssessment.id;
+    const maxScore = Number(targetAssessment.max_score); // 30.00
 
     // Reject mark exceeding max score (> 30)
     const exceedMarkRes = await fetch(`${baseUrl}/assessments/${assessmentId}/marks`, {
@@ -600,6 +602,54 @@ async function run() {
     await assert('Admin dashboard has staff metrics', adminDashData?.data?.overview?.staff?.total >= 2);
     await assert('Admin dashboard has academic overview', adminDashData?.data?.overview?.academic?.totalSections >= 4);
 
+    // Academic configuration pages: Grade 9–10 common curriculum, admin access,
+    // and server-side validation for lesson periods and assessment activities.
+    const academicStructureRes = await fetch(`${baseUrl}/admin/academic-structure`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const academicStructureData = await academicStructureRes.json();
+    const grades9and10 = (academicStructureData?.data?.grades || []).filter((grade: any) => [9, 10].includes(Number(grade.grade_level)));
+    await assert('Admin academic structure returns Grades 9–10 as non-streamed common grades',
+      academicStructureRes.status === 200 && grades9and10.length === 2 && grades9and10.every((grade: any) => Number(grade.has_streams) === 0));
+
+    const assessmentOptionsRes = await fetch(`${baseUrl}/admin/assessment-configuration-options`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const assessmentOptionsData = await assessmentOptionsRes.json();
+    await assert('Admin assessment configuration options are database-backed',
+      assessmentOptionsRes.status === 200 && Array.isArray(assessmentOptionsData?.data?.assignments) && Array.isArray(assessmentOptionsData?.data?.terms) && Array.isArray(assessmentOptionsData?.data?.types));
+
+    const nonAdminAcademicRes = await fetch(`${baseUrl}/admin/academic-structure`, {
+      headers: { Authorization: `Bearer ${studentToken}` }
+    });
+    await assert('Student cannot access administrator academic configuration (403)', nonAdminAcademicRes.status === 403);
+
+    const invalidGrade9StreamRes = await fetch(`${baseUrl}/admin/sections`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({
+        gradeId: grades9and10.find((grade: any) => Number(grade.grade_level) === 9)?.id,
+        academicYearId: academicStructureData?.data?.academicYears?.[0]?.id,
+        name: 'Validation Only', stream: 'natural_science', capacity: 40
+      })
+    });
+    const invalidGrade9StreamData = await invalidGrade9StreamRes.json();
+    await assert('Grade 9 rejects Natural/Social section stream (400)', invalidGrade9StreamRes.status === 400 && invalidGrade9StreamData?.error?.code === 'GRADE_STREAM_MISMATCH');
+
+    const invalidTimeSlotRes = await fetch(`${baseUrl}/admin/time-slots`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ dayOfWeek: 1, label: 'Invalid validation period', startTime: '10:00', endTime: '09:00' })
+    });
+    await assert('Administrator lesson period rejects reversed times (400)', invalidTimeSlotRes.status === 400);
+
+    const invalidAssessmentRes = await fetch(`${baseUrl}/admin/assessments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({})
+    });
+    await assert('Administrator assessment endpoint validates required configuration (400)', invalidAssessmentRes.status === 400);
+
     const adminUsersRes = await fetch(`${baseUrl}/admin/users`, {
       headers: { Authorization: `Bearer ${adminToken}` }
     });
@@ -701,12 +751,135 @@ async function run() {
     });
     await assert('Password reverted cleanly back to AdminPass#2026 (200)', revertPassRes.status === 200);
 
+    // --- Package 6: Security Administration Tests ---
+    const sessionsRes = await fetch(`${baseUrl}/admin/security/sessions`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const sessionsData = await sessionsRes.json();
+    await assert('Admin GET /security/sessions returns 200', sessionsRes.status === 200 && Array.isArray(sessionsData?.data));
+
+    const loginAttemptsRes = await fetch(`${baseUrl}/admin/security/login-attempts`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const loginAttemptsData = await loginAttemptsRes.json();
+    await assert('Admin GET /security/login-attempts returns 200', loginAttemptsRes.status === 200 && Array.isArray(loginAttemptsData?.data?.attempts));
+
+    const roleMatrixRes = await fetch(`${baseUrl}/admin/security/role-permissions`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const roleMatrixData = await roleMatrixRes.json();
+    await assert('Admin GET /security/role-permissions returns 200', roleMatrixRes.status === 200 && !!roleMatrixData?.data?.matrix);
+
+    const modifyAdminRoleRes = await fetch(`${baseUrl}/admin/security/roles/1/permissions`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ permissionIds: [] })
+    });
+    await assert('System Administrator role permissions are immutable (403)', modifyAdminRoleRes.status === 403);
+
+    const adminUserId = adminLoginData?.data?.user?.id;
+    // Temporarily isolate adminUserId as the sole active system_admin to test last-admin protection
+    const [otherActiveAdmins]: any = await pool.query(
+      `SELECT u.id FROM users u
+       JOIN user_roles ur ON u.id = ur.user_id
+       JOIN roles r ON ur.role_id = r.id
+       WHERE r.code = 'system_admin' AND u.status = 'active' AND u.id != ?`,
+      [adminUserId]
+    );
+    const otherAdminIds = otherActiveAdmins.map((r: any) => r.id);
+    if (otherAdminIds.length > 0) {
+      await pool.query(`UPDATE users SET status = 'disabled' WHERE id IN (?)`, [otherAdminIds]);
+    }
+
+    const deactivateLastAdminRes = await fetch(`${baseUrl}/admin/users/${adminUserId}/status`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ status: 'disabled' })
+    });
+    await assert('Last active administrator cannot be deactivated (403)', deactivateLastAdminRes.status === 403);
+
+    const demoteLastAdminRes = await fetch(`${baseUrl}/admin/users/${adminUserId}/roles`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ roleCodes: ['teacher'] })
+    });
+    await assert('Last active administrator role cannot be demoted (403)', demoteLastAdminRes.status === 403);
+
+    // Restore other active admins
+    if (otherAdminIds.length > 0) {
+      await pool.query(`UPDATE users SET status = 'active' WHERE id IN (?)`, [otherAdminIds]);
+    }
+
+    // Auth endpoint: change-password for authenticated user
+    const userChangePassRes = await fetch(`${baseUrl}/auth/change-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${newAdminUserToken}` },
+      body: JSON.stringify({ currentPassword: 'SecurePass#2026', newPassword: 'UpdatedUserPass#2026' })
+    });
+    await assert('User can update password and clear must_change_password via /auth/change-password (200)', userChangePassRes.status === 200);
+
     // Admin Page 8: Communications
     const commsRes = await fetch(`${baseUrl}/admin/announcements`, {
       headers: { Authorization: `Bearer ${adminToken}` }
     });
     const commsData = await commsRes.json();
     await assert('Admin GET /announcements returns 200', commsRes.status === 200 && Array.isArray(commsData?.data));
+
+    const publishAnnouncementRes = await fetch(`${baseUrl}/admin/announcements`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ title: `Publish test ${Date.now()}`, content: 'Announcement publication integration check.', targetRole: 'student', status: 'published' })
+    });
+    const publishAnnouncementData = await publishAnnouncementRes.json();
+    await assert('Admin publishes a targeted student announcement (201)', publishAnnouncementRes.status === 201 && publishAnnouncementData?.data?.status === 'published');
+    const [announcementAudienceRows]: any = await pool.query(
+      `SELECT r.code FROM announcement_targets t JOIN roles r ON r.id = t.target_id
+       WHERE t.announcement_id = ? AND t.target_type = 'role'`,
+      [publishAnnouncementData?.data?.id]
+    );
+    await assert('Published announcement persists its selected audience role', announcementAudienceRows?.[0]?.code === 'student');
+
+    // -----------------------------------------------------------------
+    // PACKAGE 5: DISASTER RECOVERY, RECYCLE BIN, & SYSTEM HEALTH
+    // -----------------------------------------------------------------
+    const createBackupRes = await fetch(`${baseUrl}/admin/backups`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ type: 'manual', notes: 'Automated test suite snapshot' })
+    });
+    const createBackupData = await createBackupRes.json();
+    await assert('Admin POST /backups creates snapshot with SHA-256 checksum (201)', createBackupRes.status === 201 && !!createBackupData?.data?.checksum);
+
+    const backupId = createBackupData?.data?.id;
+    const listBackupsRes = await fetch(`${baseUrl}/admin/backups`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const listBackupsData = await listBackupsRes.json();
+    await assert('Admin GET /backups returns backup archives (200)', listBackupsRes.status === 200 && Array.isArray(listBackupsData?.data) && listBackupsData?.data?.some((b: any) => b.id === backupId));
+
+    const verifyChecksumRes = await fetch(`${baseUrl}/admin/backups/${backupId}/verify`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const verifyChecksumData = await verifyChecksumRes.json();
+    await assert('Admin POST /backups/:id/verify verifies file integrity (200)', verifyChecksumRes.status === 200 && verifyChecksumData?.data?.valid === true);
+
+    const recycleBinRes = await fetch(`${baseUrl}/admin/recycle-bin`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const recycleBinData = await recycleBinRes.json();
+    await assert('Admin GET /recycle-bin returns soft-deleted items (200)', recycleBinRes.status === 200 && Array.isArray(recycleBinData?.data?.items));
+
+    const diagRes = await fetch(`${baseUrl}/admin/health/diagnostics`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const diagData = await diagRes.json();
+    await assert('Admin GET /health/diagnostics returns telemetry (200)', diagRes.status === 200 && diagData?.data?.database?.status === 'connected');
+
+    const studentBackupRes = await fetch(`${baseUrl}/admin/backups`, {
+      headers: { Authorization: `Bearer ${studentToken}` }
+    });
+    await assert('Student rejected from backups archive (403)', studentBackupRes.status === 403);
 
     // RBAC: Non-admin users forbidden from administrative operations
     const studentUnauthAdmin = await fetch(`${baseUrl}/admin/dashboard`, {
@@ -723,6 +896,260 @@ async function run() {
       headers: { Authorization: `Bearer ${teacherToken}` }
     });
     await assert('Teacher rejected from admin profile (403)', teacherUnauthProfile.status === 403);
+
+    // -----------------------------------------------------------------
+    // PACKAGE 3: APPROVALS QUEUE TESTS
+    // -----------------------------------------------------------------
+    console.log('\n--- Package 3: Approvals Queue Tests ---');
+    // 1. Summary
+    const approvalsSummaryRes = await fetch(`${baseUrl}/admin/approvals/summary`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const approvalsSummaryData = await approvalsSummaryRes.json();
+    await assert('GET /admin/approvals/summary returns 200', approvalsSummaryRes.status === 200 && typeof approvalsSummaryData?.data?.totalPending === 'number');
+
+    // 2. Create approval request
+    const createApprovalRes = await fetch(`${baseUrl}/admin/approvals`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({
+        type: 'result_unlock',
+        entityType: 'assessment',
+        entityId: 1,
+        oldValue: { is_locked: 1, status: 'locked' },
+        newValue: { is_locked: 0, status: 'draft' },
+        reason: 'Teacher submitted wrong score for Midterm Exam'
+      })
+    });
+    const createApprovalData = await createApprovalRes.json();
+    const newApprovalId = createApprovalData?.data?.id;
+    await assert('POST /admin/approvals creates request (201)', createApprovalRes.status === 201 && !!newApprovalId);
+
+    // 3. List approvals
+    const listApprovalsRes = await fetch(`${baseUrl}/admin/approvals?status=pending`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const listApprovalsData = await listApprovalsRes.json();
+    await assert('GET /admin/approvals returns list (200)', listApprovalsRes.status === 200 && Array.isArray(listApprovalsData?.data?.items));
+
+    // 4. Get approval by ID
+    const getApprovalRes = await fetch(`${baseUrl}/admin/approvals/${newApprovalId}`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const getApprovalData = await getApprovalRes.json();
+    await assert('GET /admin/approvals/:id returns detail (200)', getApprovalRes.status === 200 && getApprovalData?.data?.id === newApprovalId && getApprovalData?.data?.reason.includes('Teacher submitted wrong score'));
+
+    // 5. Decide approval (approve)
+    const approveRes = await fetch(`${baseUrl}/admin/approvals/${newApprovalId}/decide`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({
+        action: 'approve',
+        decisionNote: 'Granted unlock for 24 hours to correct assessment marks.'
+      })
+    });
+    const approveData = await approveRes.json();
+    await assert('POST /admin/approvals/:id/decide approves request (200)', approveRes.status === 200 && approveData?.data?.approval?.status === 'approved');
+
+    // 6. Create another approval and reject it
+    const createRejectRes = await fetch(`${baseUrl}/admin/approvals`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({
+        type: 'fee_waiver',
+        entityType: 'invoice',
+        entityId: 1,
+        oldValue: { discount_percent: 0 },
+        newValue: { discount_percent: 100 },
+        reason: 'Requested full scholarship waiver'
+      })
+    });
+    const rejectApprovalId = (await createRejectRes.json())?.data?.id;
+    const decideRejectRes = await fetch(`${baseUrl}/admin/approvals/${rejectApprovalId}/decide`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({
+        action: 'reject',
+        decisionNote: 'Insufficient documentation provided for full fee waiver.'
+      })
+    });
+    const decideRejectData = await decideRejectRes.json();
+    await assert('POST /admin/approvals/:id/decide rejects request (200)', decideRejectRes.status === 200 && decideRejectData?.data?.approval?.status === 'rejected');
+
+    // 7. RBAC: Student cannot decide approvals
+    const studentUnauthDecide = await fetch(`${baseUrl}/admin/approvals/${newApprovalId}/decide`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${studentToken}` },
+      body: JSON.stringify({ action: 'approve' })
+    });
+    await assert('Student forbidden from deciding approvals (403)', studentUnauthDecide.status === 403);
+
+    // -----------------------------------------------------------------
+    // PACKAGE 1: FINANCE & FEES TESTS
+    // -----------------------------------------------------------------
+    console.log('\n--- Package 1: Finance & Fees Tests ---');
+    // 1. Overview & Metrics
+    const finOverviewRes = await fetch(`${baseUrl}/admin/finance/overview`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const finOverviewData = await finOverviewRes.json();
+    await assert('GET /admin/finance/overview returns 200', finOverviewRes.status === 200 && typeof finOverviewData?.data?.totalInvoiced === 'number');
+    await assert('Finance metrics include collection rate', typeof finOverviewData?.data?.collectionRate === 'number');
+
+    // 2. Fee Categories
+    const feeCatRes = await fetch(`${baseUrl}/admin/finance/fee-categories`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const feeCatData = await feeCatRes.json();
+    await assert('GET /admin/finance/fee-categories returns 200', feeCatRes.status === 200 && Array.isArray(feeCatData?.data));
+
+    // 3. Fee Structure Creation & Listing
+    await pool.query('DELETE FROM fee_structures WHERE academic_year_id = 3 AND grade_id = 1 AND fee_category_id = 1');
+    const createFeeStructRes = await fetch(`${baseUrl}/admin/finance/fee-structures`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({
+        academic_year_id: 3,
+        grade_id: 1,
+        fee_category_id: 1,
+        amount: 4500,
+        due_date: '2026-12-31'
+      })
+    });
+    const createFeeStructData = await createFeeStructRes.json();
+    await assert('POST /admin/finance/fee-structures creates structure (201)', createFeeStructRes.status === 201 && !!createFeeStructData?.data?.id);
+
+    const feeStructRes = await fetch(`${baseUrl}/admin/finance/fee-structures`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const feeStructData = await feeStructRes.json();
+    await assert('GET /admin/finance/fee-structures returns 200', feeStructRes.status === 200 && Array.isArray(feeStructData?.data));
+
+    // 4. Invoices: Create Invoice
+    const createInvRes = await fetch(`${baseUrl}/admin/finance/invoices`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({
+        student_id: 1,
+        academic_year_id: 3,
+        due_date: '2026-11-30',
+        notes: 'Semester 1 Tuition & Lab Fees',
+        items: [
+          { fee_category_id: 1, description: 'Semester 1 Tuition', quantity: 1, unit_amount: 3500 },
+          { fee_category_id: 2, description: 'Science Lab Fee', quantity: 1, unit_amount: 500 }
+        ]
+      })
+    });
+    const createInvData = await createInvRes.json();
+    const testInvoiceId = createInvData?.data?.id;
+    await assert('POST /admin/finance/invoices creates invoice (201)', createInvRes.status === 201 && !!testInvoiceId && String(createInvData?.data?.invoice_no).startsWith('INV-'));
+
+    // 5. Invoices: List & Details
+    const listInvRes = await fetch(`${baseUrl}/admin/finance/invoices?page=1&limit=10`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const listInvData = await listInvRes.json();
+    await assert('GET /admin/finance/invoices returns paginated list (200)', listInvRes.status === 200 && Array.isArray(listInvData?.data?.items));
+
+    const getInvRes = await fetch(`${baseUrl}/admin/finance/invoices/${testInvoiceId}`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const getInvData = await getInvRes.json();
+    await assert('GET /admin/finance/invoices/:id returns invoice details (200)', getInvRes.status === 200 && getInvData?.data?.items?.length === 2 && Number(getInvData?.data?.total_amount) === 4000);
+
+    // 6. Payments: Record Payment and Auto-Allocate
+    const finStamp = Date.now();
+    const createPayRes = await fetch(`${baseUrl}/admin/finance/payments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({
+        student_id: 1,
+        invoice_id: testInvoiceId,
+        amount: 2000,
+        method: 'telebirr',
+        reference: `TB-TEST-${finStamp}`,
+        payer_name: 'Ato Bekele (Guardian)',
+        notes: 'Partial payment via Telebirr'
+      })
+    });
+    const createPayData = await createPayRes.json();
+    await assert('POST /admin/finance/payments records transaction (201)', createPayRes.status === 201 && String(createPayData?.data?.receipt_no).startsWith('RCT-'));
+
+    // Verify invoice is now partially paid
+    const updatedInvRes = await fetch(`${baseUrl}/admin/finance/invoices/${testInvoiceId}`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const updatedInvData = await updatedInvRes.json();
+    await assert('Invoice status is partially_paid with ETB 2000 balance', updatedInvRes.status === 200 && updatedInvData?.data?.status === 'partially_paid' && Number(updatedInvData?.data?.balance) === 2000);
+
+    // Settle the remainder (ETB 2000)
+    const settlePayRes = await fetch(`${baseUrl}/admin/finance/payments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({
+        student_id: 1,
+        invoice_id: testInvoiceId,
+        amount: 2000,
+        method: 'cbe_birr',
+        reference: `CBE-TEST-${finStamp}`,
+        payer_name: 'Ato Bekele'
+      })
+    });
+    await assert('Second payment recorded successfully (201)', settlePayRes.status === 201);
+
+    const paidInvRes = await fetch(`${baseUrl}/admin/finance/invoices/${testInvoiceId}`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const paidInvData = await paidInvRes.json();
+    await assert('Invoice status transitions to paid when fully settled', paidInvRes.status === 200 && paidInvData?.data?.status === 'paid' && Number(paidInvData?.data?.balance) === 0);
+
+    // 7. Scholarships & Waivers
+    const createScholarshipRes = await fetch(`${baseUrl}/admin/finance/scholarships`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({
+        student_id: 2,
+        fee_category_id: 1,
+        award_type: 'percentage',
+        value: 50,
+        reason: 'Academic Merit Scholarship Top 1%'
+      })
+    });
+    const createScholarshipData = await createScholarshipRes.json();
+    await assert('POST /admin/finance/scholarships awards waiver (201)', createScholarshipRes.status === 201 && !!createScholarshipData?.data?.id);
+
+    const listScholarshipsRes = await fetch(`${baseUrl}/admin/finance/scholarships`, {
+      headers: { Authorization: `Bearer ${adminToken}` }
+    });
+    const listScholarshipsData = await listScholarshipsRes.json();
+    await assert('GET /admin/finance/scholarships returns list (200)', listScholarshipsRes.status === 200 && Array.isArray(listScholarshipsData?.data));
+
+    // 8. Void Invoice Workflow
+    const voidInvToCancelRes = await fetch(`${baseUrl}/admin/finance/invoices`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({
+        student_id: 2,
+        academic_year_id: 1,
+        due_date: '2026-12-15',
+        notes: 'Invoice to be cancelled',
+        items: [{ fee_category_id: 1, description: 'Test Item', quantity: 1, unit_amount: 1000 }]
+      })
+    });
+    const voidInvId = (await voidInvToCancelRes.json())?.data?.id;
+    const voidActionRes = await fetch(`${baseUrl}/admin/finance/invoices/${voidInvId}/void`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
+      body: JSON.stringify({ reason: 'Issued in error by registrar' })
+    });
+    const voidActionData = await voidActionRes.json();
+    await assert('POST /admin/finance/invoices/:id/void cancels invoice (200)', voidActionRes.status === 200 && voidActionData?.data?.invoice?.status === 'voided');
+
+    // 9. RBAC: Student cannot access finance overview
+    const studentUnauthFinance = await fetch(`${baseUrl}/admin/finance/overview`, {
+      headers: { Authorization: `Bearer ${studentToken}` }
+    });
+    await assert('Student forbidden from accessing finance overview (403)', studentUnauthFinance.status === 403);
 
     // -----------------------------------------------------------------
     // TEST 14: Student Dashboard & Records

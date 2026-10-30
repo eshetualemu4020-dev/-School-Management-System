@@ -1,0 +1,889 @@
+/* PARENT & GUARDIAN PORTAL - VERTICAL SIDEBAR & INDEPENDENT SCROLLING */
+
+/* Outer Shell Lock */
+.parent-dashboard-shell {
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 0;
+  max-height: 100vh;
+  max-height: 100dvh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background-color: #F8FAFC;
+  color: #1E293B;
+  font-family: 'Plus Jakarta Sans', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+/* Fixed Application Top Bar */
+.parent-dashboard-shell .teacher-topbar {
+  flex: 0 0 64px;
+  height: 64px;
+  background-color: #1F3A5F;
+  color: #FFFFFF;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  position: relative;
+  z-index: 40;
+}
+
+/* Child Switcher Ribbon */
+.parent-child-ribbon {
+  background: #0F172A;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 8px 24px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+  z-index: 35;
+  overflow-x: auto;
+}
+
+.parent-child-ribbon-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #94A3B8;
+  white-space: nowrap;
+}
+
+.parent-child-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #CBD5E1;
+  padding: 6px 14px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+}
+
+.parent-child-pill:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #FFFFFF;
+}
+
+.parent-child-pill.active {
+  background: #2563EB;
+  border-color: #60A5FA;
+  color: #FFFFFF;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.4);
+}
+
+/* Layout: Vertical Sidebar + Main Content */
+.parent-dashboard-shell .teacher-layout {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+}
+
+/* Left Vertical Sidebar */
+.parent-dashboard-shell .teacher-sidebar {
+  flex: 0 0 250px;
+  width: 250px;
+  min-height: 0;
+  height: 100%;
+  background-color: #FFFFFF;
+  border-right: 1px solid #E2E8F0;
+  padding: 16px 12px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  gap: 16px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  box-sizing: border-box;
+}
+
+.parent-dashboard-shell .sidebar-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.parent-dashboard-shell .sidebar-nav-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: #94A3B8;
+  padding: 6px 12px;
+  letter-spacing: 0.5px;
+}
+
+.parent-dashboard-shell .sidebar-tab-btn {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: #475569;
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: all 0.15s ease-in-out;
+}
+
+.parent-dashboard-shell .sidebar-tab-btn:hover {
+  background: #EAF1F8;
+  color: #1F3A5F;
+}
+
+.parent-dashboard-shell .sidebar-tab-btn.active {
+  background: #1F3A5F;
+  color: #FFFFFF;
+  font-weight: 600;
+  box-shadow: 0 4px 10px rgba(31, 58, 95, 0.2);
+}
+
+.parent-dashboard-shell .sidebar-badge {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 10px;
+  background: #E2E8F0;
+  color: #475569;
+}
+
+.parent-dashboard-shell .sidebar-tab-btn.active .sidebar-badge {
+  background: #3B82F6;
+  color: #FFFFFF;
+}
+
+.parent-dashboard-shell .sidebar-footer-card {
+  margin-top: auto;
+  flex-shrink: 0;
+  background: #F1F5F9;
+  border: 1px solid #E2E8F0;
+  border-radius: 8px;
+  padding: 12px;
+  font-size: 12px;
+}
+
+.parent-dashboard-shell .sidebar-footer-card h4 {
+  font-size: 12px;
+  font-weight: 700;
+  color: #1F3A5F;
+  margin: 0 0 4px 0;
+}
+
+.parent-dashboard-shell .sidebar-footer-card p {
+  color: #64748B;
+  font-size: 11px;
+  margin: 0;
+  line-height: 1.4;
+}
+
+/* Main Workspace Content Area */
+.parent-dashboard-shell .teacher-content {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  padding: 24px 32px;
+  box-sizing: border-box;
+}
+
+/* Sub-Tab Navigation Bar */
+.parent-subtabs-bar {
+  display: flex;
+  gap: 8px;
+  background: #FFFFFF;
+  padding: 6px;
+  border-radius: 10px;
+  border: 1px solid #E2E8F0;
+  margin-bottom: 24px;
+  flex-wrap: wrap;
+}
+
+.parent-subtab-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: #475569;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.parent-subtab-btn:hover {
+  background: #F1F5F9;
+  color: #1E293B;
+}
+
+.parent-subtab-btn.active {
+  background: #2563EB;
+  color: #FFFFFF;
+  box-shadow: 0 2px 6px rgba(37, 99, 235, 0.25);
+}
+
+/* User profile badge & Theme toggle clearance in topbar */
+.parent-dashboard-shell .user-profile-badge {
+  position: relative;
+  margin-left: 48px;
+}
+
+/* Custom Scrollbars */
+.parent-dashboard-shell .teacher-sidebar,
+.parent-dashboard-shell .teacher-content {
+  scrollbar-width: thin;
+  scrollbar-color: #CBD5E1 transparent;
+}
+
+.parent-dashboard-shell .teacher-sidebar::-webkit-scrollbar,
+.parent-dashboard-shell .teacher-content::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.parent-dashboard-shell .teacher-sidebar::-webkit-scrollbar-track,
+.parent-dashboard-shell .teacher-content::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.parent-dashboard-shell .teacher-sidebar::-webkit-scrollbar-thumb,
+.parent-dashboard-shell .teacher-content::-webkit-scrollbar-thumb {
+  background: #CBD5E1;
+  border-radius: 4px;
+}
+
+.parent-dashboard-shell .teacher-sidebar::-webkit-scrollbar-thumb:hover,
+.parent-dashboard-shell .teacher-content::-webkit-scrollbar-thumb:hover {
+  background: #94A3B8;
+}
+
+/* Dark Mode Overrides */
+[data-dashboard-theme="dark"] .parent-dashboard-shell {
+  background-color: #0B1120;
+  color: #E2E8F0;
+}
+
+[data-dashboard-theme="dark"] .parent-dashboard-shell .teacher-topbar {
+  background-color: #0F172A;
+  border-bottom-color: #1E293B;
+}
+
+[data-dashboard-theme="dark"] .parent-dashboard-shell .teacher-sidebar {
+  background-color: #0F172A;
+  border-right-color: #1E293B;
+}
+
+[data-dashboard-theme="dark"] .parent-dashboard-shell .sidebar-tab-btn {
+  color: #94A3B8;
+}
+
+[data-dashboard-theme="dark"] .parent-dashboard-shell .sidebar-tab-btn:hover {
+  background-color: #1E293B;
+  color: #F8FAFC;
+}
+
+[data-dashboard-theme="dark"] .parent-dashboard-shell .sidebar-tab-btn.active {
+  background: #2563EB;
+  color: #FFFFFF;
+}
+
+[data-dashboard-theme="dark"] .parent-dashboard-shell .sidebar-footer-card {
+  background: #1E293B;
+  border-color: #334155;
+}
+
+[data-dashboard-theme="dark"] .parent-dashboard-shell .sidebar-footer-card h4 {
+  color: #93C5FD;
+}
+
+[data-dashboard-theme="dark"] .parent-dashboard-shell .sidebar-footer-card p {
+  color: #94A3B8;
+}
+
+[data-dashboard-theme="dark"] .parent-dashboard-shell .teacher-content {
+  background-color: #0B1120;
+  color: #E2E8F0;
+}
+
+[data-dashboard-theme="dark"] .parent-subtabs-bar {
+  background: #111C2E;
+  border-color: #1E293B;
+}
+
+[data-dashboard-theme="dark"] .parent-subtab-btn {
+  color: #94A3B8;
+}
+
+[data-dashboard-theme="dark"] .parent-subtab-btn:hover {
+  background: #1E293B;
+  color: #F8FAFC;
+}
+
+[data-dashboard-theme="dark"] .parent-subtab-btn.active {
+  background: #2563EB;
+  color: #FFFFFF;
+}
+
+[data-dashboard-theme="dark"] .parent-dashboard-shell .teacher-sidebar,
+[data-dashboard-theme="dark"] .parent-dashboard-shell .teacher-content {
+  scrollbar-color: #33445C transparent;
+}
+
+[data-dashboard-theme="dark"] .parent-dashboard-shell .teacher-sidebar::-webkit-scrollbar-thumb,
+[data-dashboard-theme="dark"] .parent-dashboard-shell .teacher-content::-webkit-scrollbar-thumb {
+  background: #33445C;
+}
+
+[data-dashboard-theme="dark"] .parent-dashboard-shell .teacher-sidebar::-webkit-scrollbar-thumb:hover,
+[data-dashboard-theme="dark"] .parent-dashboard-shell .teacher-content::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+/* ========================================================================== */
+/* PHASE 2: PERSISTENT SIDEBAR COLLAPSIBLE & MOBILE RESPONSIVE DRAWER         */
+/* ========================================================================== */
+
+/* Topbar Mobile Hamburger Button */
+.topbar-menu-toggle {
+  display: none;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: #FFFFFF;
+  padding: 6px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  align-items: center;
+  justify-content: center;
+  margin-right: 12px;
+  font-size: 16px;
+  transition: all 0.15s ease;
+}
+
+.topbar-menu-toggle:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+/* Sidebar Header Controls (Desktop Collapse & Mobile Close) */
+.sidebar-header-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 4px 8px 4px;
+  border-bottom: 1px solid #E2E8F0;
+  margin-bottom: 8px;
+}
+
+.sidebar-collapse-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 10px;
+  background: #F1F5F9;
+  border: 1px solid #E2E8F0;
+  border-radius: 6px;
+  color: #475569;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.sidebar-collapse-btn:hover {
+  background: #E2E8F0;
+  color: #1E293B;
+}
+
+/* Desktop Collapsed Sidebar State */
+.parent-dashboard-shell .teacher-sidebar.collapsed {
+  flex: 0 0 68px !important;
+  width: 68px !important;
+  padding: 16px 8px !important;
+  align-items: center;
+}
+
+.parent-dashboard-shell .teacher-sidebar.collapsed .sidebar-nav {
+  width: 100%;
+  align-items: center;
+}
+
+.parent-dashboard-shell .teacher-sidebar.collapsed .sidebar-nav-title,
+.parent-dashboard-shell .teacher-sidebar.collapsed .sidebar-tab-btn > span:not(.sidebar-icon),
+.parent-dashboard-shell .teacher-sidebar.collapsed .sidebar-badge,
+.parent-dashboard-shell .teacher-sidebar.collapsed .sidebar-footer-card {
+  display: none !important;
+}
+
+.parent-dashboard-shell .teacher-sidebar.collapsed .sidebar-tab-btn {
+  justify-content: center;
+  padding: 10px 0;
+  width: 44px;
+  height: 44px;
+  position: relative;
+}
+
+.parent-dashboard-shell .teacher-sidebar.collapsed .sidebar-tab-btn:hover::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  left: 54px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: #0F172A;
+  color: #FFFFFF;
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  z-index: 1000;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.2);
+  pointer-events: none;
+}
+
+/* Mobile Drawer Overlay Backdrop */
+.parent-drawer-backdrop {
+  display: none;
+}
+
+/* Responsive Media Queries */
+@media (max-width: 860px) {
+  .topbar-menu-toggle {
+    display: inline-flex;
+  }
+
+  .parent-drawer-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.65);
+    backdrop-filter: blur(3px);
+    z-index: 99;
+  }
+
+  .parent-dashboard-shell .teacher-sidebar {
+    position: fixed !important;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    height: 100% !important;
+    width: 280px !important;
+    z-index: 100;
+    transform: translateX(-100%);
+    transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+    box-shadow: 6px 0 24px rgba(0, 0, 0, 0.2);
+  }
+
+  .parent-dashboard-shell .teacher-sidebar.mobile-open {
+    transform: translateX(0);
+  }
+
+  .sidebar-collapse-btn {
+    display: none;
+  }
+
+  .mobile-drawer-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-bottom: 12px;
+    border-bottom: 1px solid #E2E8F0;
+    margin-bottom: 12px;
+  }
+
+  .mobile-drawer-title {
+    font-size: 14px;
+    font-weight: 700;
+    color: #1F3A5F;
+  }
+
+  .mobile-drawer-close-btn {
+    background: #F1F5F9;
+    border: none;
+    width: 32px;
+    height: 32px;
+    border-radius: 6px;
+    color: #64748B;
+    font-size: 16px;
+    font-weight: 700;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .mobile-drawer-close-btn:hover {
+    background: #E2E8F0;
+    color: #0F172A;
+  }
+
+  .parent-dashboard-shell .teacher-content {
+    padding: 20px 16px;
+  }
+}
+
+@media (max-width: 640px) {
+  .parent-dashboard-shell .teacher-topbar {
+    padding: 0 14px;
+  }
+
+  .topbar-location-badge {
+    display: none !important;
+  }
+
+  .parent-child-ribbon {
+    padding: 8px 14px;
+  }
+}
+
+/* Dark Mode Additions for Collapsible & Drawer */
+[data-dashboard-theme="dark"] .sidebar-collapse-btn {
+  background: #1E293B;
+  border-color: #334155;
+  color: #94A3B8;
+}
+
+[data-dashboard-theme="dark"] .sidebar-collapse-btn:hover {
+  background: #253347;
+  color: #F8FAFC;
+}
+
+[data-dashboard-theme="dark"] .mobile-drawer-header {
+  border-bottom-color: #334155;
+}
+
+[data-dashboard-theme="dark"] .mobile-drawer-title {
+  color: #93C5FD;
+}
+
+[data-dashboard-theme="dark"] .mobile-drawer-close-btn {
+  background: #1E293B;
+  color: #94A3B8;
+}
+
+[data-dashboard-theme="dark"] .mobile-drawer-close-btn:hover {
+  background: #334155;
+  color: #FFFFFF;
+}
+
+/* ========================================================================== */
+/* PHASE 4: LEVEL 2 CONTEXTUAL CHILD SUB-SIDEBAR & WORKSPACE LAYOUT           */
+/* ========================================================================== */
+
+/* Child Workspace Container */
+.child-workspace-layout {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  position: relative;
+}
+
+/* Level 2 Sub-Sidebar (Desktop) */
+.child-sub-sidebar {
+  flex: 0 0 240px;
+  width: 240px;
+  min-height: 0;
+  height: 100%;
+  background-color: #FFFFFF;
+  border-right: 1px solid #E2E8F0;
+  padding: 16px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  box-sizing: border-box;
+  flex-shrink: 0;
+}
+
+/* Back to All Children Button */
+.child-back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid #E2E8F0;
+  background: #F8FAFC;
+  color: #475569;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  width: fit-content;
+}
+
+.child-back-btn:hover {
+  background: #EDF2F7;
+  color: #0F172A;
+  border-color: #CBD5E1;
+}
+
+/* Child Identity Card inside Sub-Sidebar */
+.child-identity-card {
+  background: #F8FAFC;
+  border: 1px solid #E2E8F0;
+  border-radius: 10px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.child-avatar-sm {
+  width: 38px;
+  height: 38px;
+  border-radius: 8px;
+  background: #1F3A5F;
+  color: #FFFFFF;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.child-name-text {
+  font-size: 13px;
+  font-weight: 700;
+  color: #0F172A;
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.child-admission-text {
+  font-size: 11px;
+  color: #64748B;
+  display: block;
+}
+
+.child-placement-meta {
+  font-size: 12px;
+  color: #1E293B;
+  border-top: 1px solid #E2E8F0;
+  padding-top: 8px;
+}
+
+.child-switcher-select {
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid #CBD5E1;
+  background: #FFFFFF;
+  font-size: 11px;
+  font-weight: 600;
+  color: #1F3A5F;
+  cursor: pointer;
+}
+
+/* Subnav List */
+.child-subnav-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1 1 auto;
+}
+
+.child-subnav-title {
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+  color: #94A3B8;
+  letter-spacing: 0.6px;
+  padding: 4px 8px;
+}
+
+.child-subnav-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: #475569;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.child-subnav-btn:hover:not(.restricted) {
+  background: #F1F5F9;
+  color: #0F172A;
+}
+
+.child-subnav-btn.active {
+  background: #2563EB;
+  color: #FFFFFF;
+  box-shadow: 0 2px 6px rgba(37, 99, 235, 0.25);
+}
+
+.child-subnav-btn.restricted {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.child-subnav-icon {
+  font-size: 15px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.child-subnav-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.child-subnav-badge {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 8px;
+  background: #E2E8F0;
+  color: #475569;
+}
+
+.child-subnav-btn.active .child-subnav-badge {
+  background: #1D4ED8;
+  color: #FFFFFF;
+}
+
+.child-subnav-lock {
+  font-size: 11px;
+}
+
+/* Child Workspace Main Content Area */
+.child-workspace-content {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 24px 28px;
+  box-sizing: border-box;
+}
+
+/* Mobile Responsive Child Navigation */
+@media (max-width: 860px) {
+  .child-workspace-layout {
+    flex-direction: column;
+  }
+
+  .child-sub-sidebar {
+    width: 100%;
+    flex: 0 0 auto;
+    height: auto;
+    border-right: none;
+    border-bottom: 1px solid #E2E8F0;
+    padding: 12px 16px;
+    gap: 10px;
+  }
+
+  .child-subnav-list {
+    flex-direction: row;
+    overflow-x: auto;
+    padding-bottom: 4px;
+    gap: 6px;
+  }
+
+  .child-subnav-title {
+    display: none;
+  }
+
+  .child-subnav-btn {
+    white-space: nowrap;
+    width: auto;
+    padding: 7px 12px;
+    flex-shrink: 0;
+  }
+
+  .child-workspace-content {
+    padding: 16px;
+  }
+}
+
+/* Dark Mode Support for Child Sub-Sidebar */
+[data-dashboard-theme="dark"] .child-sub-sidebar {
+  background-color: #0F172A;
+  border-right-color: #1E293B;
+  border-bottom-color: #1E293B;
+}
+
+[data-dashboard-theme="dark"] .child-identity-card {
+  background: #111C2E;
+  border-color: #1E293B;
+}
+
+[data-dashboard-theme="dark"] .child-name-text {
+  color: #F8FAFC;
+}
+
+[data-dashboard-theme="dark"] .child-placement-meta {
+  color: #CBD5E1;
+  border-top-color: #1E293B;
+}
+
+[data-dashboard-theme="dark"] .child-back-btn {
+  background: #1E293B;
+  border-color: #334155;
+  color: #94A3B8;
+}
+
+[data-dashboard-theme="dark"] .child-back-btn:hover {
+  background: #253347;
+  color: #FFFFFF;
+}
+
+[data-dashboard-theme="dark"] .child-switcher-select {
+  background: #1E293B;
+  border-color: #334155;
+  color: #E2E8F0;
+}
+
+[data-dashboard-theme="dark"] .child-subnav-btn {
+  color: #94A3B8;
+}
+
+[data-dashboard-theme="dark"] .child-subnav-btn:hover:not(.restricted) {
+  background: #1E293B;
+  color: #F8FAFC;
+}
+
+[data-dashboard-theme="dark"] .child-subnav-btn.active {
+  background: #2563EB;
+  color: #FFFFFF;
+}

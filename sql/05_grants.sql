@@ -63,6 +63,13 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON `school_erp`.`result_publications` TO 'e
 GRANT SELECT, INSERT, UPDATE, DELETE ON `school_erp`.`results` TO 'erp_app'@'localhost';
 GRANT SELECT, INSERT, UPDATE, DELETE ON `school_erp`.`report_card_snapshots` TO 'erp_app'@'localhost';
 GRANT SELECT, INSERT, UPDATE, DELETE ON `school_erp`.`external_exam_results` TO 'erp_app'@'localhost';
+GRANT SELECT, INSERT, UPDATE ON `school_erp`.`academic_progression_policies` TO 'erp_app'@'localhost';
+GRANT SELECT, INSERT, DELETE ON `school_erp`.`academic_subject_prerequisites` TO 'erp_app'@'localhost';
+GRANT SELECT, INSERT, UPDATE ON `school_erp`.`academic_course_enrollments` TO 'erp_app'@'localhost';
+GRANT SELECT, INSERT, UPDATE ON `school_erp`.`academic_exam_schedules` TO 'erp_app'@'localhost';
+GRANT SELECT, INSERT, UPDATE ON `school_erp`.`academic_probation_records` TO 'erp_app'@'localhost';
+GRANT SELECT, INSERT, UPDATE ON `school_erp`.`academic_graduation_reviews` TO 'erp_app'@'localhost';
+GRANT SELECT, INSERT ON `school_erp`.`academic_transcript_issues` TO 'erp_app'@'localhost';
 GRANT SELECT, INSERT, UPDATE, DELETE ON `school_erp`.`fee_categories` TO 'erp_app'@'localhost';
 GRANT SELECT, INSERT, UPDATE, DELETE ON `school_erp`.`fee_structures` TO 'erp_app'@'localhost';
 GRANT SELECT, INSERT, UPDATE, DELETE ON `school_erp`.`scholarships` TO 'erp_app'@'localhost';
@@ -144,6 +151,13 @@ GRANT SELECT ON `school_erp`.`result_publications` TO 'erp_readonly'@'localhost'
 GRANT SELECT ON `school_erp`.`results` TO 'erp_readonly'@'localhost';
 GRANT SELECT ON `school_erp`.`report_card_snapshots` TO 'erp_readonly'@'localhost';
 GRANT SELECT ON `school_erp`.`external_exam_results` TO 'erp_readonly'@'localhost';
+GRANT SELECT ON `school_erp`.`academic_progression_policies` TO 'erp_readonly'@'localhost';
+GRANT SELECT ON `school_erp`.`academic_subject_prerequisites` TO 'erp_readonly'@'localhost';
+GRANT SELECT ON `school_erp`.`academic_course_enrollments` TO 'erp_readonly'@'localhost';
+GRANT SELECT ON `school_erp`.`academic_exam_schedules` TO 'erp_readonly'@'localhost';
+GRANT SELECT ON `school_erp`.`academic_probation_records` TO 'erp_readonly'@'localhost';
+GRANT SELECT ON `school_erp`.`academic_graduation_reviews` TO 'erp_readonly'@'localhost';
+GRANT SELECT ON `school_erp`.`academic_transcript_issues` TO 'erp_readonly'@'localhost';
 GRANT SELECT ON `school_erp`.`fee_categories` TO 'erp_readonly'@'localhost';
 GRANT SELECT ON `school_erp`.`fee_structures` TO 'erp_readonly'@'localhost';
 GRANT SELECT ON `school_erp`.`scholarships` TO 'erp_readonly'@'localhost';

@@ -24,6 +24,9 @@ const recoveryLimiter = rateLimit({
 router.post('/register', controller.register);
 router.post('/login', loginLimiter, controller.login);
 router.post('/logout', controller.logout);
+router.get('/notifications', authenticateToken, controller.getNotifications);
+router.patch('/notifications/:id/read', authenticateToken, controller.markNotificationRead);
+router.post('/notifications/read-all', authenticateToken, controller.markAllNotificationsRead);
 router.post('/forgot-password', recoveryLimiter, controller.forgotPassword);
 router.post('/reset-password', recoveryLimiter, controller.resetPassword);
 router.get('/me', (req, res, next) => {
@@ -35,5 +38,12 @@ router.get('/me', (req, res, next) => {
 	}
 	next();
 }, authenticateToken, controller.me);
+
+// Two-factor authentication (TOTP)
+router.post('/2fa/setup', authenticateToken, controller.setup2FA);
+router.post('/2fa/verify', authenticateToken, controller.verify2FA);
+router.post('/2fa/disable', authenticateToken, controller.disable2FA);
+router.post('/2fa/authenticate', loginLimiter, controller.authenticate2FA);
+router.post('/change-password', authenticateToken, controller.changePassword);
 
 export default router;

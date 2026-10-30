@@ -7,6 +7,7 @@ export interface AuthUser {
   staffId?: number;
   staffName?: string;
   staffType?: string;
+  mustChangePassword?: boolean;
 }
 
 export interface ApiSuccess<T> {

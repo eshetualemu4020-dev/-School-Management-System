@@ -74,20 +74,23 @@ async function seed() {
       );
     }
 
-    // 5. Grades (Grade 10, Grade 11, Grade 12)
+    // 5. Grades (Grade 9 through Grade 12)
     let [g11Rows] = await conn.query<RowDataPacket[]>(`SELECT id FROM grades WHERE grade_level = 11`);
     const grade11Id = g11Rows[0]?.id || 3;
     let [g12Rows] = await conn.query<RowDataPacket[]>(`SELECT id FROM grades WHERE grade_level = 12`);
     const grade12Id = g12Rows[0]?.id || 4;
     let [g10Rows] = await conn.query<RowDataPacket[]>(`SELECT id FROM grades WHERE grade_level = 10`);
     const grade10Id = g10Rows[0]?.id || 2;
-
+ let [g9Rows] = await conn.query<RowDataPacket[]>(`SELECT id FROM grades WHERE grade_level = 9`);
+    const grade9Id = g9Rows[0]?.id || 1;
     // 6. Sections
     const sections = [
       { id: 1, gradeId: grade11Id, name: 'Grade 11 - Natural Science - A', stream: 'natural_science', capacity: 40 },
       { id: 2, gradeId: grade11Id, name: 'Grade 11 - Natural Science - B', stream: 'natural_science', capacity: 40 },
       { id: 3, gradeId: grade12Id, name: 'Grade 12 - Natural Science - A', stream: 'natural_science', capacity: 40 },
-      { id: 4, gradeId: grade10Id, name: 'Grade 10 - Section A', stream: 'none', capacity: 45 }
+      { id: 4, gradeId: grade10Id, name: 'Grade 10 - Section A', stream: 'none', capacity: 55 },
+      { id: 5, gradeId: grade9Id, name: 'Grade 9 - Section A', stream: 'none', capacity: 60 }
+
     ];
     for (const sec of sections) {
       await conn.query(

@@ -19,6 +19,7 @@ import studentRoutes from './modules/student/student.routes';
 import librarianRoutes from './modules/librarian/librarian.routes';
 import registrarRoutes from './modules/registrar/registrar.routes';
 import parentRoutes from './modules/parent/parent.routes';
+import { startNotificationOutboxWorker } from './modules/notifications/outbox.worker';
 
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
@@ -36,7 +37,8 @@ app.use(helmet({
 
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 300,
+  max: env.NODE_ENV === 'production' ? 1000 : 50000,
+  skip: () => env.NODE_ENV !== 'production',
   standardHeaders: true,
   legacyHeaders: false,
   message: {
@@ -63,7 +65,7 @@ app.use(cors({
 }));
 
 app.use((req, res, next) => express.json({
-  limit: req.method === 'POST' && req.path === '/api/v1/admin/students' ? '28mb' : '8mb'
+  limit: req.method === 'POST' && ['/api/v1/admin/students', '/api/v1/registrar/students'].includes(req.path) ? '28mb' : '8mb'
 })(req, res, next));
 
 // Request tracking ID
@@ -105,6 +107,7 @@ if (process.env.NODE_ENV !== 'test') {
     console.log(`📡 API Mounted at http://localhost:${PORT}/api/v1`);
     const dbOk = await testConnection();
     console.log(`🗄️  Database Status: ${dbOk ? 'CONNECTED (MySQL 8)' : 'FAILED TO CONNECT'}`);
+    startNotificationOutboxWorker();
     console.log(`===============================================`);
   });
 }

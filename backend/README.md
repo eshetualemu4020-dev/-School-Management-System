@@ -20,6 +20,21 @@ npm test
 
 The backend expects the existing MySQL schema and seed data to be installed before the acceptance suite runs.
 
+## Academic Lifecycle Migration
+
+Apply the lifecycle migration after the base schema and earlier migrations:
+
+```powershell
+cd .\backend
+npx tsx scripts\run_migration.ts ..\sql\migrations\14_academic_lifecycle.sql
+```
+
+The migration adds academic progression policies, course prerequisites/enrollments, exam schedules, probation tracking, graduation reviews, and immutable issued-transcript snapshots. Configure a progression policy for each academic-year/grade combination before enrolling students in courses or evaluating promotions/graduation. The form's suggested thresholds are not applied until an administrator saves the school's approved values.
+
+If the application uses a least-privilege database account, grant it the new-table privileges listed in `sql\05_grants.sql` after applying the migration. Do not reuse the placeholder credentials in that setup script.
+
+The administrator's **Attendance & Academic Results → Academic Lifecycle** area then manages exam schedules, course enrollment constraints, published-result transcripts and rankings, promotion/retention review, academic probation, and graduation review/certificate issuance. Promotion, graduation, timetable, course, and transcript issuance actions are recorded in the audit log.
+
 ## Environment Variables
 
 Required:

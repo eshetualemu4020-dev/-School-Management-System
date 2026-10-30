@@ -27,7 +27,8 @@ export const authenticateToken = async (
   const cookie = req.headers.cookie?.split(';').map((item) => item.trim())
     .find((item) => item.startsWith(`${AUTH_COOKIE_NAME}=`));
   const cookieToken = cookie?.slice(AUTH_COOKIE_NAME.length + 1);
-  const token = cookieToken || bearerToken;
+  const queryToken = typeof req.query.token === 'string' ? req.query.token : undefined;
+  const token = cookieToken || bearerToken || queryToken;
 
   if (!token) {
     res.status(401).json({
@@ -60,6 +61,12 @@ export const authenticateToken = async (
         });
         return;
       }
+
+      // Update session last_seen_at timestamp
+      pool.query(
+        `UPDATE refresh_sessions SET last_seen_at = NOW(3) WHERE token_hash = ? AND revoked_at IS NULL`,
+        [tokenHash]
+      ).catch(() => {});
     } else {
       res.status(401).json({
         error: { code: 'INVALID_TOKEN', message: 'Invalid or expired authentication token.' }
@@ -69,7 +76,7 @@ export const authenticateToken = async (
 
     // Fetch user and check active status
     const [userRows] = await pool.query<RowDataPacket[]>(
-      `SELECT id, username, email, status FROM users WHERE id = ?`,
+      `SELECT id, username, email, status, must_change_password FROM users WHERE id = ?`,
       [decoded.userId]
     );
 
@@ -132,8 +139,33 @@ export const authenticateToken = async (
       permissions,
       staffId,
       staffName,
-      staffType
+      staffType,
+      mustChangePassword: Boolean(user.must_change_password)
     };
+
+    const requestPath = req.originalUrl.split('?')[0];
+    const passwordChangeAllowedPaths = ['/api/v1/auth/me', '/api/v1/auth/change-password', '/api/v1/auth/logout'];
+    if (req.user.mustChangePassword && !passwordChangeAllowedPaths.includes(requestPath)) {
+      res.status(403).json({
+        error: { code: 'PASSWORD_CHANGE_REQUIRED', message: 'Change your temporary password before using the application.' }
+      });
+      return;
+    }
+
+    // Check maintenance mode: only system_admin can access during maintenance
+    const [maintRows] = await pool.query<RowDataPacket[]>(
+      `SELECT value_json FROM system_settings WHERE setting_key = 'system.maintenance_mode'`
+    );
+    const inMaintenance = maintRows[0]?.value_json === 'true' || maintRows[0]?.value_json === true;
+    if (inMaintenance && !roles.includes('system_admin')) {
+      res.status(503).json({
+        error: {
+          code: 'SYSTEM_IN_MAINTENANCE',
+          message: 'The system is currently undergoing scheduled maintenance. Please check back shortly.'
+        }
+      });
+      return;
+    }
 
     next();
   } catch (err) {

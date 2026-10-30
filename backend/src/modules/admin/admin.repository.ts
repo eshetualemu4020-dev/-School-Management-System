@@ -1,5 +1,5 @@
 import { pool } from '../../config/database';
-import { RowDataPacket, ResultSetHeader } from 'mysql2/promise';
+import { RowDataPacket, ResultSetHeader, PoolConnection } from 'mysql2/promise';
 import bcrypt from 'bcrypt';
 import { AppError } from '../../middleware/errorHandler';
 import { createHash, randomUUID } from 'crypto';
@@ -7,6 +7,143 @@ import { mkdir, writeFile, unlink, readFile } from 'fs/promises';
 import path from 'path';
 
 export class AdminRepository {
+  async getAdminNotificationPreferences(userId: number) {
+    const settingKey = `user.notifications.${userId}`;
+    const [rows] = await pool.query<RowDataPacket[]>(`SELECT value_json FROM system_settings WHERE setting_key = ? LIMIT 1`, [settingKey]);
+    const defaults = { securityAlerts: true, guardianBroadcasts: true, attendanceDigest: false, systemErrors: true };
+    if (!rows.length) return defaults;
+    let value = rows[0].value_json;
+    if (typeof value === 'string') {
+      try { value = JSON.parse(value); } catch { return defaults; }
+    }
+    return Object.fromEntries(Object.keys(defaults).map((key) => [key, typeof value?.[key] === 'boolean' ? value[key] : defaults[key as keyof typeof defaults]]));
+  }
+
+  async saveAdminNotificationPreferences(userId: number, username: string, preferences: {
+    securityAlerts: boolean; guardianBroadcasts: boolean; attendanceDigest: boolean; systemErrors: boolean;
+  }) {
+    const settingKey = `user.notifications.${userId}`;
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await conn.query(
+        `INSERT INTO system_settings (setting_key, value_json, description, version, updated_by, updated_at)
+         VALUES (?, ?, 'Administrator notification delivery preferences', 1, ?, NOW(3))
+         ON DUPLICATE KEY UPDATE value_json = VALUES(value_json), version = version + 1, updated_by = VALUES(updated_by), updated_at = NOW(3)`,
+        [settingKey, JSON.stringify(preferences), userId]
+      );
+      await conn.query(
+        `INSERT INTO audit_logs (occurred_at, actor_user_id, actor_username, action, entity_type, entity_id, outcome, changes, reason)
+         VALUES (NOW(3), ?, ?, 'ADMIN_NOTIFICATION_PREFERENCES_UPDATE', 'users', ?, 'success', ?, 'Administrator notification preferences updated')`,
+        [userId, username, String(userId), JSON.stringify(preferences)]
+      );
+      await conn.commit();
+      return preferences;
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async saveStaffPhoto(payload: {
+    staffId: number;
+    originalName: string;
+    mimeType: string;
+    dataBase64: string;
+    adminUserId: number;
+    adminUsername: string;
+  }) {
+    const match = /^data:(image\/(?:jpeg|png));base64,([A-Za-z0-9+/]+={0,2})$/.exec(payload.dataBase64 || '');
+    if (!match || match[1] !== payload.mimeType) throw new AppError('Upload a valid JPEG or PNG staff photo.', 400, 'INVALID_STAFF_PHOTO');
+    const mimeType = match[1];
+    const bytes = Buffer.from(match[2], 'base64');
+    const isJpeg = mimeType === 'image/jpeg' && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+    const isPng = mimeType === 'image/png' && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+    if (!bytes.length || bytes.length > 5 * 1024 * 1024 || (!isJpeg && !isPng)) {
+      throw new AppError('Staff photo must be a valid JPEG or PNG image no larger than 5 MB.', 400, 'INVALID_STAFF_PHOTO');
+    }
+
+    const storageName = `${randomUUID()}.${isJpeg ? 'jpg' : 'png'}`;
+    const storageKey = `staff_photos/${storageName}`;
+    const dir = path.resolve(process.env.PRIVATE_UPLOAD_DIR || path.join(process.cwd(), 'private_uploads'), 'staff_photos');
+    await mkdir(dir, { recursive: true });
+    const filePath = path.join(dir, storageName);
+    await writeFile(filePath, bytes, { flag: 'wx', mode: 0o600 });
+
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [staffRows] = await conn.query<RowDataPacket[]>(
+        `SELECT id, photo_document_id FROM staff WHERE id = ? AND deleted_at IS NULL FOR UPDATE`,
+        [payload.staffId]
+      );
+      if (!staffRows.length) throw new AppError('Staff record not found.', 404, 'STAFF_NOT_FOUND');
+
+      const previousDocumentId = staffRows[0].photo_document_id;
+      const [docResult] = await conn.query<ResultSetHeader>(
+        `INSERT INTO documents (owner_type, owner_id, doc_type, original_name, storage_key, mime_type, size_bytes, checksum_sha256, scan_status, uploaded_by)
+         VALUES ('staff', ?, 'staff_profile_photo', ?, ?, ?, ?, ?, 'skipped', ?)`,
+        [
+          payload.staffId,
+          path.basename(payload.originalName || 'staff-photo').slice(0, 255),
+          storageKey,
+          mimeType,
+          bytes.length,
+          createHash('sha256').update(bytes).digest('hex'),
+          payload.adminUserId
+        ]
+      );
+      await conn.query(`UPDATE staff SET photo_document_id = ? WHERE id = ?`, [docResult.insertId, payload.staffId]);
+      if (previousDocumentId) {
+        await conn.query(`UPDATE documents SET deleted_at = NOW(3) WHERE id = ?`, [previousDocumentId]);
+      }
+      await conn.query(
+        `INSERT INTO audit_logs (occurred_at, actor_user_id, actor_username, action, entity_type, entity_id, outcome, changes, reason)
+         VALUES (NOW(3), ?, ?, 'STAFF_PHOTO_UPDATE', 'staff', ?, 'success', ?, 'Staff profile photo updated')`,
+        [
+          payload.adminUserId,
+          payload.adminUsername,
+          String(payload.staffId),
+          JSON.stringify({ documentId: docResult.insertId, replacedDocumentId: previousDocumentId || null })
+        ]
+      );
+      await conn.commit();
+      return { documentId: docResult.insertId };
+    } catch (err) {
+      await conn.rollback();
+      await unlink(filePath).catch(() => undefined);
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getStaffPhoto(staffId: number) {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT d.storage_key, d.mime_type
+         FROM staff st
+         JOIN documents d ON d.id = st.photo_document_id
+        WHERE st.id = ? AND st.deleted_at IS NULL AND d.deleted_at IS NULL
+          AND d.doc_type = 'staff_profile_photo' LIMIT 1`,
+      [staffId]
+    );
+    if (!rows.length) throw new AppError('Staff photo not found.', 404, 'STAFF_PHOTO_NOT_FOUND');
+    const storageKey = String(rows[0].storage_key);
+    if (!/^staff_photos\/[a-f0-9-]+\.(?:jpg|png)$/i.test(storageKey)) {
+      throw new AppError('Staff photo storage reference is invalid.', 500, 'STAFF_PHOTO_STORAGE_ERROR');
+    }
+    try {
+      return {
+        bytes: await readFile(path.resolve(process.env.PRIVATE_UPLOAD_DIR || path.join(process.cwd(), 'private_uploads'), storageKey)),
+        mimeType: String(rows[0].mime_type)
+      };
+    } catch {
+      throw new AppError('Staff photo file is unavailable.', 404, 'STAFF_PHOTO_NOT_FOUND');
+    }
+  }
+
   async getStudentPhoto(id: number) {
     const [rows] = await pool.query<RowDataPacket[]>(
       `SELECT d.storage_key, d.mime_type FROM students s
@@ -24,13 +161,56 @@ export class AdminRepository {
     }
   }
 
+  async getAdminProfilePhoto(userId: number) {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT storage_key, mime_type FROM documents
+       WHERE owner_type = 'user' AND owner_id = ? AND doc_type = 'admin_profile_photo' AND deleted_at IS NULL
+       ORDER BY id DESC LIMIT 1`, [userId]
+    );
+    if (!rows.length) throw new AppError('Administrator profile photo not found.', 404, 'ADMIN_PHOTO_NOT_FOUND');
+    const key = String(rows[0].storage_key);
+    if (!/^admin_profile_photos\/[a-f0-9-]+\.(?:jpg|png)$/i.test(key)) throw new AppError('Administrator photo reference is invalid.', 500, 'ADMIN_PHOTO_STORAGE_ERROR');
+    try {
+      return { bytes: await readFile(path.resolve(process.env.PRIVATE_UPLOAD_DIR || path.join(process.cwd(), 'private_uploads'), key)), mimeType: String(rows[0].mime_type) };
+    } catch {
+      throw new AppError('Administrator profile photo is unavailable.', 404, 'ADMIN_PHOTO_NOT_FOUND');
+    }
+  }
+
+  private async saveAdminProfilePhoto(userId: number, uploadedBy: number, photo: { originalName?: string; mimeType?: string; dataBase64?: string }) {
+    const match = /^data:(image\/(?:jpeg|png));base64,([A-Za-z0-9+/=]+)$/.exec(String(photo.dataBase64 || ''));
+    if (!match) throw new AppError('Choose a valid JPEG or PNG profile photo.', 400, 'INVALID_ADMIN_PHOTO');
+    const mimeType = match[1];
+    const bytes = Buffer.from(match[2], 'base64');
+    const jpeg = mimeType === 'image/jpeg' && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+    const png = mimeType === 'image/png' && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+    if (!bytes.length || bytes.length > 5 * 1024 * 1024 || (!jpeg && !png)) throw new AppError('Profile photo must be a valid JPEG or PNG image no larger than 5 MB.', 400, 'INVALID_ADMIN_PHOTO');
+    const storageName = `${randomUUID()}.${jpeg ? 'jpg' : 'png'}`;
+    const key = `admin_profile_photos/${storageName}`;
+    const dir = path.resolve(process.env.PRIVATE_UPLOAD_DIR || path.join(process.cwd(), 'private_uploads'), 'admin_profile_photos');
+    await mkdir(dir, { recursive: true });
+    const photoPath = path.join(dir, storageName);
+    await writeFile(photoPath, bytes, { flag: 'wx', mode: 0o600 });
+    try {
+      await pool.query(`UPDATE documents SET deleted_at = NOW() WHERE owner_type = 'user' AND owner_id = ? AND doc_type = 'admin_profile_photo' AND deleted_at IS NULL`, [userId]);
+      await pool.query(
+        `INSERT INTO documents (owner_type, owner_id, doc_type, original_name, storage_key, mime_type, size_bytes, checksum_sha256, scan_status, uploaded_by)
+         VALUES ('user', ?, 'admin_profile_photo', ?, ?, ?, ?, ?, 'skipped', ?)`,
+        [userId, path.basename(photo.originalName || 'admin-profile-photo').slice(0, 255), key, mimeType, bytes.length, createHash('sha256').update(bytes).digest('hex'), uploadedBy]
+      );
+    } catch (err) {
+      await unlink(photoPath).catch(() => undefined);
+      throw err;
+    }
+  }
+
   // =========================================================================
   // PAGE 1: DASHBOARD OVERVIEW & ALERT METRICS
   // =========================================================================
   async getSchoolOverviewMetrics() {
     // 1. Student Counts
     const [studRes] = await pool.query<RowDataPacket[]>(
-      `SELECT 
+      `SELECT
          COUNT(*) as totalStudents,
          SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as activeStudents,
          SUM(CASE WHEN status = 'applicant' THEN 1 ELSE 0 END) as applicantStudents,
@@ -42,7 +222,7 @@ export class AdminRepository {
 
     // 2. Staff Counts
     const [staffRes] = await pool.query<RowDataPacket[]>(
-      `SELECT 
+      `SELECT
          COUNT(*) as totalStaff,
          SUM(CASE WHEN staff_type = 'teacher' THEN 1 ELSE 0 END) as totalTeachers,
          SUM(CASE WHEN staff_type = 'administrator' THEN 1 ELSE 0 END) as totalAdministrators,
@@ -54,7 +234,7 @@ export class AdminRepository {
 
     // 3. Academic Structure Counts
     const [academicRes] = await pool.query<RowDataPacket[]>(
-      `SELECT 
+      `SELECT
          (SELECT COUNT(*) FROM sections WHERE status = 'active') as totalSections,
          (SELECT COUNT(*) FROM subjects WHERE status = 'active') as totalSubjects,
          (SELECT COUNT(*) FROM classrooms WHERE status = 'active') as totalClassrooms,
@@ -64,7 +244,7 @@ export class AdminRepository {
 
     // 4. Today Attendance
     const [attendanceToday] = await pool.query<RowDataPacket[]>(
-      `SELECT 
+      `SELECT
          COUNT(DISTINCT s.id) as sessionsToday,
          SUM(CASE WHEN r.status_code = 'present' THEN 1 ELSE 0 END) as presentToday,
          SUM(CASE WHEN r.status_code = 'absent' THEN 1 ELSE 0 END) as absentToday,
@@ -77,7 +257,7 @@ export class AdminRepository {
 
     // 5. Total Attendance All-Time
     const [attStats] = await pool.query<RowDataPacket[]>(
-      `SELECT 
+      `SELECT
          COUNT(*) as totalRecords,
          SUM(CASE WHEN status_code = 'present' THEN 1 ELSE 0 END) as presentCount,
          SUM(CASE WHEN status_code = 'absent' THEN 1 ELSE 0 END) as absentCount
@@ -89,7 +269,7 @@ export class AdminRepository {
 
     // 6. Assessments & Marks
     const [marksStats] = await pool.query<RowDataPacket[]>(
-      `SELECT 
+      `SELECT
          (SELECT COUNT(*) FROM assessments) as totalAssessments,
          (SELECT COUNT(*) FROM marks WHERE status = 'locked') as approvedMarks,
          (SELECT COUNT(*) FROM marks WHERE status = 'submitted') as submittedMarks,
@@ -106,7 +286,7 @@ export class AdminRepository {
 
     // 8. Finance
     const [financeRes] = await pool.query<RowDataPacket[]>(
-      `SELECT 
+      `SELECT
          IFNULL((SELECT SUM(line_total) FROM invoice_items), 0) as totalInvoiced,
          IFNULL((SELECT SUM(amount) FROM payments WHERE status = 'posted'), 0) as totalCollected`
     );
@@ -115,7 +295,7 @@ export class AdminRepository {
 
     // 9. Trend: Students by Grade & Stream
     const [enrollmentByGrade] = await pool.query<RowDataPacket[]>(
-      `SELECT 
+      `SELECT
          g.grade_level,
          g.display_name as grade_name,
          COUNT(e.id) as student_count,
@@ -130,7 +310,7 @@ export class AdminRepository {
 
     // 10. Trend: Attendance by Day (Last 7 active days)
     const [recentAttendanceTrend] = await pool.query<RowDataPacket[]>(
-      `SELECT 
+      `SELECT
          s.attendance_date,
          COUNT(r.id) as total_logged,
          SUM(CASE WHEN r.status_code = 'present' THEN 1 ELSE 0 END) as present_logged,
@@ -145,20 +325,20 @@ export class AdminRepository {
     // 11. Alerts Calculation
     // Incomplete registrations
     const [incReg] = await pool.query<RowDataPacket[]>(
-      `SELECT COUNT(*) as count FROM students 
+      `SELECT COUNT(*) as count FROM students
        WHERE status = 'applicant' OR date_of_birth IS NULL OR phone IS NULL`
     );
 
     // Unassigned Teachers
     const [unassignedSec] = await pool.query<RowDataPacket[]>(
-      `SELECT COUNT(*) as count FROM sections 
+      `SELECT COUNT(*) as count FROM sections
        WHERE status = 'active' AND (homeroom_staff_id IS NULL OR homeroom_staff_id = 0)`
     );
 
     // Missing Attendance Today
     const [missingAtt] = await pool.query<RowDataPacket[]>(
       `SELECT COUNT(*) as count FROM sections sec
-       WHERE sec.status = 'active' 
+       WHERE sec.status = 'active'
        AND sec.id NOT IN (SELECT section_id FROM attendance_sessions WHERE attendance_date = CURDATE())`
     );
 
@@ -312,7 +492,7 @@ export class AdminRepository {
     incompleteOnly?: boolean;
   }) {
     let sql = `
-      SELECT 
+      SELECT
         s.id,
         s.admission_no,
         s.first_name,
@@ -344,7 +524,7 @@ export class AdminRepository {
       LEFT JOIN enrollments e ON s.id = e.student_id AND e.status = 'active'
       LEFT JOIN sections sec ON e.section_id = sec.id
       LEFT JOIN grades g ON sec.grade_id = g.id
-      WHERE 1=1
+      WHERE s.deleted_at IS NULL
     `;
     const params: any[] = [];
 
@@ -396,7 +576,7 @@ export class AdminRepository {
 
   async getStudentById(id: number) {
     const [studRows] = await pool.query<RowDataPacket[]>(
-      `SELECT 
+      `SELECT
          s.*,
          e.id as enrollment_id,
          e.roll_no,
@@ -926,7 +1106,7 @@ export class AdminRepository {
 
   async getTransfersHistory() {
     const [rows] = await pool.query<RowDataPacket[]>(
-      `SELECT 
+      `SELECT
          tw.*,
          s.admission_no,
          CONCAT_WS(' ', s.first_name, s.father_name) as student_name,
@@ -942,35 +1122,42 @@ export class AdminRepository {
   // =========================================================================
   // PAGE 3: STAFF AND USER MANAGEMENT
   // =========================================================================
-  async getStaff(search?: string, staffType?: string, status?: string) {
+  async getStaff(search?: string, staffType?: string, status?: string, options?: { limit?: number; offset?: number; sort?: string }) {
     let sql = `
-      SELECT 
+      SELECT
         st.id,
         st.employee_no,
         st.first_name,
         st.father_name,
         st.grandfather_name,
         st.gender,
+        st.date_of_birth,
         st.phone,
         st.email,
+        st.address,
         st.job_title,
         st.department,
         st.staff_type,
         st.hire_date,
         st.status,
         st.user_id,
+        st.photo_document_id,
         u.username as linked_username,
         u.status as user_account_status,
-        (SELECT COUNT(*) FROM teaching_assignments ta WHERE ta.staff_id = st.id AND ta.is_active = 1) as active_assignments_count
+        (SELECT COUNT(*) FROM teaching_assignments ta WHERE ta.staff_id = st.id AND ta.is_active = 1) as active_assignments_count,
+        (SELECT COUNT(*) FROM staff_qualifications q WHERE q.staff_id = st.id AND q.deleted_at IS NULL) as qualification_count,
+        (SELECT COUNT(*) FROM qualification_documents qd
+           JOIN staff_qualifications q2 ON q2.id = qd.qualification_id AND q2.deleted_at IS NULL
+          WHERE q2.staff_id = st.id AND qd.is_active = 1 AND qd.verification_status = 'pending') as unverified_document_count
       FROM staff st
       LEFT JOIN users u ON st.user_id = u.id
-      WHERE 1=1
+      WHERE st.deleted_at IS NULL
     `;
     const params: any[] = [];
 
     if (search) {
-      sql += ` AND (st.employee_no LIKE ? OR st.first_name LIKE ? OR st.father_name LIKE ? OR st.department LIKE ?)`;
-      params.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`);
+      sql += ` AND (st.employee_no LIKE ? OR st.first_name LIKE ? OR st.father_name LIKE ? OR st.department LIKE ? OR st.email LIKE ? OR st.job_title LIKE ?)`;
+      params.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`);
     }
 
     if (staffType) {
@@ -983,9 +1170,481 @@ export class AdminRepository {
       params.push(status);
     }
 
-    sql += ` ORDER BY st.staff_type ASC, st.first_name ASC`;
+    const sortMap: Record<string, string> = {
+      name: 'st.first_name ASC, st.father_name ASC',
+      name_desc: 'st.first_name DESC, st.father_name DESC',
+      employee_no: 'st.employee_no ASC',
+      load: 'active_assignments_count DESC, st.first_name ASC',
+      load_asc: 'active_assignments_count ASC, st.first_name ASC',
+      status: 'st.status ASC, st.first_name ASC',
+      hire_date: 'st.hire_date DESC, st.first_name ASC'
+    };
+    sql += ` ORDER BY ${sortMap[options?.sort || ''] || 'st.staff_type ASC, st.first_name ASC'}`;
+
+    const limit = Number(options?.limit);
+    const offset = Number(options?.offset);
+    if (Number.isInteger(limit) && limit > 0) {
+      sql += ` LIMIT ? OFFSET ?`;
+      params.push(limit, Number.isInteger(offset) && offset > 0 ? offset : 0);
+    }
+
     const [rows] = await pool.query<RowDataPacket[]>(sql, params);
     return rows;
+  }
+
+  async getTeacherProfile(staffId: number) {
+    const [staffRows] = await pool.query<RowDataPacket[]>(
+      `SELECT st.id, st.employee_no, st.first_name, st.father_name, st.grandfather_name, st.name_am,
+              st.gender, st.date_of_birth, st.phone, st.email, st.address, st.job_title, st.department,
+              st.staff_type, st.hire_date, st.end_date, st.status, st.user_id, st.photo_document_id,
+              st.created_at, st.updated_at,
+              u.username AS linked_username, u.status AS user_account_status, u.email AS account_email,
+              u.must_change_password, u.locked_until, u.last_login_at
+         FROM staff st
+         LEFT JOIN users u ON st.user_id = u.id
+        WHERE st.id = ? AND st.deleted_at IS NULL`,
+      [staffId]
+    );
+    if (!staffRows.length) return null;
+    const staff = staffRows[0];
+
+    const [assignments] = await pool.query<RowDataPacket[]>(
+      `SELECT ta.id, ta.section_id, ta.subject_id, ta.academic_year_id, ta.is_active, ta.created_at,
+              sub.code AS subject_code, sub.name AS subject_name,
+              sec.name AS section_name, sec.stream AS section_stream,
+              g.grade_level, g.display_name AS grade_name
+         FROM teaching_assignments ta
+         JOIN subjects sub ON ta.subject_id = sub.id
+         JOIN sections sec ON ta.section_id = sec.id
+         JOIN grades g ON sec.grade_id = g.id
+        WHERE ta.staff_id = ? AND ta.is_active = 1
+        ORDER BY g.grade_level ASC, sec.name ASC, sub.name ASC`,
+      [staffId]
+    );
+
+    const [homeroom] = await pool.query<RowDataPacket[]>(
+      `SELECT sec.id, sec.name AS section_name, g.display_name AS grade_name, g.grade_level,
+              ay.name AS academic_year
+         FROM sections sec
+         JOIN grades g ON sec.grade_id = g.id
+         LEFT JOIN academic_years ay ON sec.academic_year_id = ay.id
+        WHERE sec.homeroom_staff_id = ? AND sec.status = 'active'
+        ORDER BY g.grade_level ASC, sec.name ASC`,
+      [staffId]
+    );
+
+    const [timetable] = await pool.query<RowDataPacket[]>(
+      `SELECT te.id, ts.day_of_week, ts.start_time, ts.end_time, ts.label AS slot_label,
+              sub.code AS subject_code, sub.name AS subject_name,
+              sec.name AS section_name, g.display_name AS grade_name
+         FROM timetable_entries te
+         JOIN time_slots ts ON te.time_slot_id = ts.id
+         JOIN subjects sub ON te.subject_id = sub.id
+         JOIN sections sec ON te.section_id = sec.id
+         JOIN grades g ON sec.grade_id = g.id
+        WHERE te.staff_id = ?
+        ORDER BY ts.day_of_week ASC, ts.start_time ASC`,
+      [staffId]
+    );
+
+    const [attendance] = await pool.query<RowDataPacket[]>(
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN status = 'present' THEN 1 ELSE 0 END) AS present,
+              SUM(CASE WHEN status = 'absent' THEN 1 ELSE 0 END) AS absent,
+              SUM(CASE WHEN status = 'late' THEN 1 ELSE 0 END) AS late,
+              SUM(CASE WHEN status = 'on_leave' THEN 1 ELSE 0 END) AS on_leave
+         FROM staff_attendance
+        WHERE staff_id = ? AND attendance_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)`,
+      [staffId]
+    );
+
+    return {
+      staff,
+      assignments,
+      homeroom,
+      timetable,
+      attendanceSummary: attendance[0] || { total: 0, present: 0, absent: 0, late: 0, on_leave: 0 }
+    };
+  }
+
+  async getTeacherAssignments(staffId: number) {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT ta.id, ta.section_id, ta.subject_id, ta.academic_year_id, ta.is_active,
+              sub.code AS subject_code, sub.name AS subject_name,
+              sec.name AS section_name, sec.stream AS section_stream,
+              g.grade_level, g.display_name AS grade_name,
+              ay.name AS academic_year,
+              (SELECT COUNT(*) FROM enrollments e WHERE e.section_id = sec.id AND e.status = 'active') AS student_count
+         FROM teaching_assignments ta
+         JOIN subjects sub ON ta.subject_id = sub.id
+         JOIN sections sec ON ta.section_id = sec.id
+         JOIN grades g ON sec.grade_id = g.id
+         LEFT JOIN academic_years ay ON ta.academic_year_id = ay.id
+        WHERE ta.staff_id = ? AND ta.is_active = 1
+        ORDER BY g.grade_level ASC, sec.name ASC, sub.name ASC`,
+      [staffId]
+    );
+    return rows;
+  }
+
+  // =========================================================================
+  // STAFF QUALIFICATIONS & SUPPORTING DOCUMENTS
+  // =========================================================================
+  async getStaffQualifications(staffId: number) {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT q.id, q.staff_id, q.qualification_level, q.title, q.institution, q.field_of_study,
+              q.award_date, q.grade_or_class, q.registration_no, q.notes, q.created_at, q.updated_at,
+              qd.id AS document_link_id, qd.document_id, qd.verification_status, qd.verification_note,
+              qd.verified_at, qd.verified_by, qd.is_active AS document_active,
+              d.original_name, d.mime_type, d.size_bytes, d.scan_status, d.created_at AS uploaded_at,
+              verifier.username AS verified_by_username
+         FROM staff_qualifications q
+         LEFT JOIN qualification_documents qd ON qd.qualification_id = q.id AND qd.is_active = 1
+         LEFT JOIN documents d ON d.id = qd.document_id AND d.deleted_at IS NULL
+         LEFT JOIN users verifier ON verifier.id = qd.verified_by
+        WHERE q.staff_id = ? AND q.deleted_at IS NULL
+        ORDER BY COALESCE(q.award_date, '1900-01-01') DESC, q.id DESC`,
+      [staffId]
+    );
+    return rows;
+  }
+
+  async getQualificationById(id: number) {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, staff_id, qualification_level, title, institution, field_of_study, award_date,
+              grade_or_class, registration_no, notes, deleted_at
+         FROM staff_qualifications WHERE id = ? LIMIT 1`,
+      [id]
+    );
+    return rows[0] || null;
+  }
+
+  async getActiveQualificationDocument(qualificationId: number) {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT qd.id, qd.qualification_id, qd.document_id, qd.verification_status, qd.verification_note,
+              qd.verified_by, qd.verified_at, qd.uploaded_by, qd.created_at,
+              d.storage_key, d.mime_type, d.original_name, d.size_bytes, d.checksum_sha256, d.scan_status
+         FROM qualification_documents qd
+         JOIN documents d ON d.id = qd.document_id
+        WHERE qd.qualification_id = ? AND qd.is_active = 1 AND d.deleted_at IS NULL
+        ORDER BY qd.id DESC LIMIT 1`,
+      [qualificationId]
+    );
+    return rows[0] || null;
+  }
+
+  async getQualificationDocumentByLinkId(linkId: number) {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT qd.id, qd.qualification_id, qd.document_id, qd.verification_status, qd.is_active,
+              d.storage_key, d.mime_type, d.original_name, d.size_bytes, d.checksum_sha256, d.scan_status
+         FROM qualification_documents qd
+         JOIN documents d ON d.id = qd.document_id
+        WHERE qd.id = ? AND d.deleted_at IS NULL LIMIT 1`,
+      [linkId]
+    );
+    return rows[0] || null;
+  }
+
+  async createQualification(payload: {
+    staffId: number;
+    qualificationLevel: string;
+    title: string;
+    institution: string;
+    fieldOfStudy?: string;
+    awardDate?: string;
+    gradeOrClass?: string;
+    registrationNo?: string;
+    notes?: string;
+    adminUserId: number;
+    adminUsername: string;
+  }) {
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [staffRows] = await conn.query<RowDataPacket[]>(
+        `SELECT id, first_name, father_name FROM staff WHERE id = ? AND deleted_at IS NULL FOR UPDATE`,
+        [payload.staffId]
+      );
+      if (!staffRows.length) throw new AppError('Staff record not found.', 404, 'STAFF_NOT_FOUND');
+
+      const [res] = await conn.query<ResultSetHeader>(
+        `INSERT INTO staff_qualifications
+           (staff_id, qualification_level, title, institution, field_of_study, award_date,
+            grade_or_class, registration_no, notes, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          payload.staffId,
+          payload.qualificationLevel,
+          payload.title,
+          payload.institution,
+          payload.fieldOfStudy || null,
+          payload.awardDate || null,
+          payload.gradeOrClass || null,
+          payload.registrationNo || null,
+          payload.notes || null,
+          payload.adminUserId
+        ]
+      );
+      await conn.query(
+        `INSERT INTO audit_logs (occurred_at, actor_user_id, actor_username, action, entity_type, entity_id, outcome, changes, reason)
+         VALUES (NOW(3), ?, ?, 'STAFF_QUALIFICATION_CREATE', 'staff_qualifications', ?, 'success', ?, 'Qualification recorded for staff member')`,
+        [
+          payload.adminUserId,
+          payload.adminUsername,
+          String(res.insertId),
+          JSON.stringify({
+            staffId: payload.staffId,
+            qualificationLevel: payload.qualificationLevel,
+            title: payload.title,
+            institution: payload.institution
+          })
+        ]
+      );
+      await conn.commit();
+      return { id: res.insertId };
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async updateQualification(id: number, payload: {
+    qualificationLevel?: string;
+    title?: string;
+    institution?: string;
+    fieldOfStudy?: string;
+    awardDate?: string;
+    gradeOrClass?: string;
+    registrationNo?: string;
+    notes?: string;
+    adminUserId: number;
+    adminUsername: string;
+  }) {
+    const fields: string[] = [];
+    const params: any[] = [];
+    if (payload.qualificationLevel !== undefined) { fields.push('qualification_level = ?'); params.push(payload.qualificationLevel); }
+    if (payload.title !== undefined) { fields.push('title = ?'); params.push(payload.title.trim()); }
+    if (payload.institution !== undefined) { fields.push('institution = ?'); params.push(payload.institution.trim()); }
+    if (payload.fieldOfStudy !== undefined) { fields.push('field_of_study = ?'); params.push(payload.fieldOfStudy || null); }
+    if (payload.awardDate !== undefined) { fields.push('award_date = ?'); params.push(payload.awardDate || null); }
+    if (payload.gradeOrClass !== undefined) { fields.push('grade_or_class = ?'); params.push(payload.gradeOrClass || null); }
+    if (payload.registrationNo !== undefined) { fields.push('registration_no = ?'); params.push(payload.registrationNo || null); }
+    if (payload.notes !== undefined) { fields.push('notes = ?'); params.push(payload.notes || null); }
+    if (!fields.length) throw new AppError('Provide at least one qualification field to update.', 400, 'EMPTY_UPDATE');
+
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [rows] = await conn.query<RowDataPacket[]>(
+        `SELECT id FROM staff_qualifications WHERE id = ? AND deleted_at IS NULL FOR UPDATE`, [id]
+      );
+      if (!rows.length) throw new AppError('Qualification not found.', 404, 'QUALIFICATION_NOT_FOUND');
+      params.push(id);
+      await conn.query(`UPDATE staff_qualifications SET ${fields.join(', ')} WHERE id = ?`, params);
+      await conn.query(
+        `INSERT INTO audit_logs (occurred_at, actor_user_id, actor_username, action, entity_type, entity_id, outcome, changes, reason)
+         VALUES (NOW(3), ?, ?, 'STAFF_QUALIFICATION_UPDATE', 'staff_qualifications', ?, 'success', ?, 'Qualification details updated')`,
+        [
+          payload.adminUserId,
+          payload.adminUsername,
+          String(id),
+          JSON.stringify(Object.fromEntries(Object.entries(payload).filter(([key]) => !['adminUserId', 'adminUsername'].includes(key))))
+        ]
+      );
+      await conn.commit();
+      return true;
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async deleteQualification(id: number, adminUserId: number, adminUsername: string) {
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [rows] = await conn.query<RowDataPacket[]>(
+        `SELECT id, staff_id, title FROM staff_qualifications WHERE id = ? AND deleted_at IS NULL FOR UPDATE`, [id]
+      );
+      if (!rows.length) throw new AppError('Qualification not found.', 404, 'QUALIFICATION_NOT_FOUND');
+      await conn.query(`UPDATE staff_qualifications SET deleted_at = NOW(3) WHERE id = ?`, [id]);
+      await conn.query(
+        `UPDATE qualification_documents SET is_active = 0, verification_status = 'replaced' WHERE qualification_id = ? AND is_active = 1`,
+        [id]
+      );
+      await conn.query(
+        `INSERT INTO audit_logs (occurred_at, actor_user_id, actor_username, action, entity_type, entity_id, outcome, changes, reason)
+         VALUES (NOW(3), ?, ?, 'STAFF_QUALIFICATION_DELETE', 'staff_qualifications', ?, 'success', ?, 'Qualification removed')`,
+        [adminUserId, adminUsername, String(id), JSON.stringify({ staffId: rows[0].staff_id, title: rows[0].title })]
+      );
+      await conn.commit();
+      return true;
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async attachQualificationDocument(payload: {
+    qualificationId: number;
+    originalName: string;
+    mimeType: string;
+    bytes: Buffer;
+    adminUserId: number;
+    adminUsername: string;
+  }) {
+    const extensionMap: Record<string, string> = {
+      'application/pdf': 'pdf',
+      'image/jpeg': 'jpg',
+      'image/png': 'png'
+    };
+    const extension = extensionMap[payload.mimeType];
+    if (!extension) throw new AppError('Unsupported document type.', 400, 'UNSUPPORTED_DOCUMENT_TYPE');
+
+    const storageName = `${randomUUID()}.${extension}`;
+    const storageKey = `staff_qualification_documents/${storageName}`;
+    const dir = path.resolve(
+      process.env.PRIVATE_UPLOAD_DIR || path.join(process.cwd(), 'private_uploads'),
+      'staff_qualification_documents'
+    );
+    await mkdir(dir, { recursive: true });
+    const filePath = path.join(dir, storageName);
+    await writeFile(filePath, payload.bytes, { flag: 'wx', mode: 0o600 });
+
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [qualRows] = await conn.query<RowDataPacket[]>(
+        `SELECT id, staff_id, title FROM staff_qualifications WHERE id = ? AND deleted_at IS NULL FOR UPDATE`,
+        [payload.qualificationId]
+      );
+      if (!qualRows.length) throw new AppError('Qualification not found.', 404, 'QUALIFICATION_NOT_FOUND');
+
+      // Supersede any existing active document for this qualification.
+      await conn.query(
+        `UPDATE qualification_documents SET is_active = 0, verification_status = 'replaced' WHERE qualification_id = ? AND is_active = 1`,
+        [payload.qualificationId]
+      );
+
+      const [docRes] = await conn.query<ResultSetHeader>(
+        `INSERT INTO documents (owner_type, owner_id, doc_type, original_name, storage_key, mime_type, size_bytes, checksum_sha256, scan_status, uploaded_by)
+         VALUES ('staff_qualification', ?, 'qualification_certificate', ?, ?, ?, ?, ?, 'skipped', ?)`,
+        [
+          payload.qualificationId,
+          path.basename(payload.originalName).slice(0, 255),
+          storageKey,
+          payload.mimeType,
+          payload.bytes.length,
+          createHash('sha256').update(payload.bytes).digest('hex'),
+          payload.adminUserId
+        ]
+      );
+      const [linkRes] = await conn.query<ResultSetHeader>(
+        `INSERT INTO qualification_documents (qualification_id, document_id, verification_status, is_active, uploaded_by)
+         VALUES (?, ?, 'pending', 1, ?)`,
+        [payload.qualificationId, docRes.insertId, payload.adminUserId]
+      );
+      await conn.query(
+        `INSERT INTO audit_logs (occurred_at, actor_user_id, actor_username, action, entity_type, entity_id, outcome, changes, reason)
+         VALUES (NOW(3), ?, ?, 'STAFF_QUALIFICATION_DOCUMENT_UPLOAD', 'staff_qualifications', ?, 'success', ?, 'Supporting document uploaded')`,
+        [
+          payload.adminUserId,
+          payload.adminUsername,
+          String(payload.qualificationId),
+          JSON.stringify({ documentId: docRes.insertId, originalName: payload.originalName, mimeType: payload.mimeType, sizeBytes: payload.bytes.length })
+        ]
+      );
+      await conn.commit();
+      return { linkId: linkRes.insertId, documentId: docRes.insertId };
+    } catch (err) {
+      await conn.rollback();
+      await unlink(filePath).catch(() => undefined);
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async setQualificationDocumentVerification(payload: {
+    linkId: number;
+    status: 'verified' | 'rejected';
+    note?: string;
+    adminUserId: number;
+    adminUsername: string;
+  }) {
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [rows] = await conn.query<RowDataPacket[]>(
+        `SELECT qd.id, qd.qualification_id, qd.document_id, qd.verification_status
+           FROM qualification_documents qd
+          WHERE qd.id = ? FOR UPDATE`,
+        [payload.linkId]
+      );
+      if (!rows.length) throw new AppError('Qualification document not found.', 404, 'QUALIFICATION_DOCUMENT_NOT_FOUND');
+      if (!Number(rows[0].qualification_id)) throw new AppError('Qualification document is not linked.', 409, 'QUALIFICATION_DOCUMENT_UNLINKED');
+
+      await conn.query(
+        `UPDATE qualification_documents
+            SET verification_status = ?, verification_note = ?, verified_by = ?, verified_at = NOW(3)
+          WHERE id = ?`,
+        [payload.status, payload.note || null, payload.adminUserId, payload.linkId]
+      );
+      await conn.query(
+        `INSERT INTO audit_logs (occurred_at, actor_user_id, actor_username, action, entity_type, entity_id, outcome, changes, reason)
+         VALUES (NOW(3), ?, ?, ?, 'staff_qualifications', ?, 'success', ?, ?)`,
+        [
+          payload.adminUserId,
+          payload.adminUsername,
+          payload.status === 'verified' ? 'STAFF_QUALIFICATION_DOCUMENT_VERIFY' : 'STAFF_QUALIFICATION_DOCUMENT_REJECT',
+          String(rows[0].qualification_id),
+          JSON.stringify({ documentId: rows[0].document_id, verificationStatus: payload.status }),
+          payload.note || `Document marked ${payload.status}`
+        ]
+      );
+      await conn.commit();
+      return true;
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getQualificationAuditHistory(staffId: number, limit = 50) {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT al.id, al.occurred_at, al.actor_username, al.action, al.outcome, al.changes, al.reason
+         FROM audit_logs al
+         JOIN staff_qualifications q ON q.id = al.entity_id AND al.entity_type = 'staff_qualifications'
+        WHERE q.staff_id = ?
+          AND al.action LIKE 'STAFF_QUALIFICATION%'
+        ORDER BY al.occurred_at DESC, al.id DESC
+        LIMIT ?`,
+      [staffId, limit]
+    );
+    return rows;
+  }
+
+  async readQualificationDocumentFile(linkId: number) {
+    const doc = await this.getQualificationDocumentByLinkId(linkId);
+    if (!doc) throw new AppError('Qualification document not found.', 404, 'QUALIFICATION_DOCUMENT_NOT_FOUND');
+    const key = String(doc.storage_key);
+    if (!/^staff_qualification_documents\/[a-f0-9-]+\.(?:pdf|jpg|png)$/i.test(key)) {
+      throw new AppError('Qualification document storage reference is invalid.', 500, 'QUALIFICATION_DOCUMENT_STORAGE_ERROR');
+    }
+    try {
+      const bytes = await readFile(path.resolve(process.env.PRIVATE_UPLOAD_DIR || path.join(process.cwd(), 'private_uploads'), key));
+      return { bytes, mimeType: String(doc.mime_type), originalName: String(doc.original_name) };
+    } catch {
+      throw new AppError('Qualification document file is unavailable.', 404, 'QUALIFICATION_DOCUMENT_NOT_FOUND');
+    }
   }
 
   async createStaff(payload: {
@@ -1006,7 +1665,24 @@ export class AdminRepository {
     roleCode?: string;
     adminUserId: number;
     adminUsername: string;
+    photo?: { originalName: string; mimeType: string; dataBase64: string };
   }) {
+    let photoFilePath: string | undefined;
+    let photoBytes: Buffer | undefined;
+    let photoMime = '';
+    let photoName = '';
+    if (payload.photo) {
+      const match = /^data:(image\/(?:jpeg|png));base64,([A-Za-z0-9+/]+={0,2})$/.exec(payload.photo.dataBase64 || '');
+      if (!match || match[1] !== payload.photo.mimeType) throw new AppError('Upload a valid JPEG or PNG staff photo.', 400, 'INVALID_STAFF_PHOTO');
+      photoMime = match[1];
+      photoBytes = Buffer.from(match[2], 'base64');
+      if (!photoBytes.length || photoBytes.length > 5 * 1024 * 1024) throw new AppError('Staff photo must be no larger than 5 MB.', 400, 'STAFF_PHOTO_TOO_LARGE');
+      const isJpeg = photoMime === 'image/jpeg' && photoBytes[0] === 0xff && photoBytes[1] === 0xd8 && photoBytes[2] === 0xff;
+      const isPng = photoMime === 'image/png' && photoBytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+      if (!isJpeg && !isPng) throw new AppError('The photo contents do not match a supported image format.', 400, 'INVALID_STAFF_PHOTO');
+      photoName = path.basename(payload.photo.originalName || 'staff-photo').slice(0, 255);
+    }
+
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
@@ -1025,8 +1701,8 @@ export class AdminRepository {
       // Create linked user account if requested
       if (payload.createAccount && payload.username && payload.password) {
         const [userCheck] = await conn.query<RowDataPacket[]>(
-          `SELECT id FROM users WHERE username = ?`,
-          [payload.username]
+          `SELECT id FROM users WHERE username = ? OR email = ? LIMIT 1`,
+          [payload.username, payload.email || null]
         );
         if (userCheck.length > 0) {
           throw new AppError(`Username '${payload.username}' is already in use.`, 409, 'DUPLICATE_USERNAME');
@@ -1035,13 +1711,13 @@ export class AdminRepository {
         const passwordHash = await bcrypt.hash(payload.password, 10);
         const [uRes] = await conn.query<ResultSetHeader>(
           `INSERT INTO users (username, email, phone, password_hash, status, must_change_password)
-           VALUES (?, ?, ?, ?, 'active', 0)`,
-          [payload.username, payload.email || `${payload.username}@school.et`, payload.phone || null, passwordHash]
+           VALUES (?, ?, ?, ?, 'active', 1)`,
+          [payload.username, payload.email || null, payload.phone || null, passwordHash]
         );
         userId = uRes.insertId;
 
         // Assign role
-        let targetRole = payload.roleCode || (payload.staffType === 'teacher' ? 'teacher' : payload.staffType === 'librarian' ? 'librarian' : payload.staffType === 'accountant' ? 'accountant' : 'system_admin');
+        let targetRole = payload.roleCode!;
         if (targetRole === 'administrator' || targetRole === 'admin') {
           targetRole = 'system_admin';
         }
@@ -1049,12 +1725,11 @@ export class AdminRepository {
           `SELECT id FROM roles WHERE code = ? LIMIT 1`,
           [targetRole]
         );
-        if (roleRows.length > 0) {
-          await conn.query(
-            `INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)`,
-            [userId, roleRows[0].id]
-          );
-        }
+        if (roleRows.length === 0) throw new AppError('Selected account role does not exist.', 400, 'INVALID_ROLE');
+        await conn.query(
+          `INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)`,
+          [userId, roleRows[0].id]
+        );
       }
 
       // Insert staff
@@ -1078,6 +1753,31 @@ export class AdminRepository {
       );
       const staffId = stRes.insertId;
 
+      // Attach the profile photo after the staff row exists, so owner_id is known.
+      let photoDocumentId: number | null = null;
+      if (photoBytes) {
+        const storageName = `${randomUUID()}.${photoMime === 'image/jpeg' ? 'jpg' : 'png'}`;
+        const storageDir = path.resolve(process.env.PRIVATE_UPLOAD_DIR || path.join(process.cwd(), 'private_uploads'), 'staff_photos');
+        await mkdir(storageDir, { recursive: true });
+        photoFilePath = path.join(storageDir, storageName);
+        await writeFile(photoFilePath, photoBytes, { flag: 'wx', mode: 0o600 });
+        const [docResult] = await conn.query<ResultSetHeader>(
+          `INSERT INTO documents (owner_type, owner_id, doc_type, original_name, storage_key, mime_type, size_bytes, checksum_sha256, scan_status, uploaded_by)
+           VALUES ('staff', ?, 'staff_profile_photo', ?, ?, ?, ?, ?, 'skipped', ?)`,
+          [
+            staffId,
+            photoName,
+            `staff_photos/${storageName}`,
+            photoMime,
+            photoBytes.length,
+            createHash('sha256').update(photoBytes).digest('hex'),
+            payload.adminUserId
+          ]
+        );
+        photoDocumentId = docResult.insertId;
+        await conn.query(`UPDATE staff SET photo_document_id = ? WHERE id = ?`, [photoDocumentId, staffId]);
+      }
+
       // Audit log
       await conn.query(
         `INSERT INTO audit_logs (occurred_at, actor_user_id, actor_username, action, entity_type, entity_id, outcome, changes, reason)
@@ -1086,14 +1786,15 @@ export class AdminRepository {
           payload.adminUserId,
           payload.adminUsername,
           String(staffId),
-          JSON.stringify({ employeeNo: payload.employeeNo, staffType: payload.staffType, userId })
+          JSON.stringify({ employeeNo: payload.employeeNo, staffType: payload.staffType, userId, hasPhoto: Boolean(photoDocumentId) })
         ]
       );
 
       await conn.commit();
-      return { id: staffId, employeeNo: payload.employeeNo, userId };
+      return { id: staffId, employeeNo: payload.employeeNo, userId, photoDocumentId };
     } catch (err) {
       await conn.rollback();
+      if (photoFilePath) await unlink(photoFilePath).catch(() => undefined);
       throw err;
     } finally {
       conn.release();
@@ -1101,36 +1802,79 @@ export class AdminRepository {
   }
 
   async updateStaff(id: number, payload: {
+    employeeNo?: string;
+    firstName?: string;
+    fatherName?: string;
+    grandfatherName?: string;
+    gender?: 'female' | 'male';
+    dateOfBirth?: string;
     phone?: string;
     email?: string;
+    address?: string;
     jobTitle?: string;
     department?: string;
-    status?: string;
+    staffType?: 'teacher' | 'administrator' | 'support' | 'librarian' | 'accountant' | 'other';
+    hireDate?: string;
+    status?: 'active' | 'on_leave' | 'terminated';
     adminUserId: number;
     adminUsername: string;
   }) {
     const fields: string[] = [];
     const params: any[] = [];
 
+    if (payload.employeeNo !== undefined) { fields.push('employee_no = ?'); params.push(payload.employeeNo.trim()); }
+    if (payload.firstName !== undefined) { fields.push('first_name = ?'); params.push(payload.firstName.trim()); }
+    if (payload.fatherName !== undefined) { fields.push('father_name = ?'); params.push(payload.fatherName.trim()); }
+    if (payload.grandfatherName !== undefined) { fields.push('grandfather_name = ?'); params.push(payload.grandfatherName.trim() || null); }
+    if (payload.gender !== undefined) { fields.push('gender = ?'); params.push(payload.gender); }
+    if (payload.dateOfBirth !== undefined) { fields.push('date_of_birth = ?'); params.push(payload.dateOfBirth || null); }
     if (payload.phone !== undefined) { fields.push('phone = ?'); params.push(payload.phone || null); }
     if (payload.email !== undefined) { fields.push('email = ?'); params.push(payload.email || null); }
-    if (payload.jobTitle) { fields.push('job_title = ?'); params.push(payload.jobTitle); }
-    if (payload.department) { fields.push('department = ?'); params.push(payload.department); }
+    if (payload.address !== undefined) { fields.push('address = ?'); params.push(payload.address || null); }
+    if (payload.jobTitle !== undefined) { fields.push('job_title = ?'); params.push(payload.jobTitle.trim()); }
+    if (payload.department !== undefined) { fields.push('department = ?'); params.push(payload.department || null); }
+    if (payload.staffType !== undefined) { fields.push('staff_type = ?'); params.push(payload.staffType); }
+    if (payload.hireDate !== undefined) { fields.push('hire_date = ?'); params.push(payload.hireDate || null); }
     if (payload.status) { fields.push('status = ?'); params.push(payload.status); }
+    if (payload.status === 'terminated') { fields.push('end_date = COALESCE(end_date, CURRENT_DATE)'); }
+    else if (payload.status === 'active') { fields.push('end_date = NULL'); }
 
-    if (fields.length === 0) return true;
+    if (fields.length === 0) throw new AppError('Provide at least one staff field to update.', 400, 'EMPTY_UPDATE');
 
-    params.push(id);
-    await pool.query(`UPDATE staff SET ${fields.join(', ')} WHERE id = ?`, params);
-
-    // Audit log
-    await pool.query(
-      `INSERT INTO audit_logs (occurred_at, actor_user_id, actor_username, action, entity_type, entity_id, outcome, changes, reason)
-       VALUES (NOW(), ?, ?, 'STAFF_UPDATE', 'staff', ?, 'success', ?, 'Staff profile updated')`,
-      [payload.adminUserId, payload.adminUsername, String(id), JSON.stringify(payload)]
-    );
-
-    return true;
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [staffRows] = await conn.query<RowDataPacket[]>(`SELECT id FROM staff WHERE id = ? FOR UPDATE`, [id]);
+      if (!staffRows.length) throw new AppError('Staff record not found.', 404, 'STAFF_NOT_FOUND');
+      params.push(id);
+      await conn.query(`UPDATE staff SET ${fields.join(', ')} WHERE id = ?`, params);
+      const accountFields: string[] = [];
+      const accountParams: any[] = [];
+      if (payload.phone !== undefined) { accountFields.push('u.phone = ?'); accountParams.push(payload.phone || null); }
+      if (payload.email !== undefined) { accountFields.push('u.email = ?'); accountParams.push(payload.email || null); }
+      if (accountFields.length) {
+        accountParams.push(id);
+        await conn.query(`UPDATE users u JOIN staff st ON st.user_id = u.id SET ${accountFields.join(', ')} WHERE st.id = ?`, accountParams);
+      }
+      if (payload.status === 'terminated') {
+        await conn.query(
+          `UPDATE users u JOIN staff st ON st.user_id = u.id SET u.status = 'disabled' WHERE st.id = ?`, [id]
+        );
+      }
+      await conn.query(
+        `INSERT INTO audit_logs (occurred_at, actor_user_id, actor_username, action, entity_type, entity_id, outcome, changes, reason)
+         VALUES (NOW(), ?, ?, 'STAFF_UPDATE', 'staff', ?, 'success', ?, 'Staff profile updated')`,
+        [payload.adminUserId, payload.adminUsername, String(id), JSON.stringify(payload)]
+      );
+      await conn.commit();
+      return true;
+    } catch (err) {
+      await conn.rollback();
+      if ((err as any)?.code === 'ER_DUP_ENTRY') throw new AppError('That employee number or staff account email is already assigned to another record.', 409, 'DUPLICATE_STAFF_RECORD');
+      throw err;
+    } finally {
+      conn.release();
+    }
   }
 
   async createUser(payload: {
@@ -1156,8 +1900,8 @@ export class AdminRepository {
 
       const passwordHash = await bcrypt.hash(payload.password, 10);
       const [uRes] = await conn.query<ResultSetHeader>(
-        `INSERT INTO users (username, email, phone, password_hash, status)
-         VALUES (?, ?, ?, ?, 'active')`,
+        `INSERT INTO users (username, email, phone, password_hash, status, must_change_password)
+         VALUES (?, ?, ?, ?, 'active', 1)`,
         [payload.username, payload.email, payload.phone || null, passwordHash]
       );
       const userId = uRes.insertId;
@@ -1171,12 +1915,11 @@ export class AdminRepository {
         `SELECT id FROM roles WHERE code = ? LIMIT 1`,
         [targetRole]
       );
-      if (roleRows.length > 0) {
-        await conn.query(
-          `INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)`,
-          [userId, roleRows[0].id]
-        );
-      }
+      if (roleRows.length === 0) throw new AppError('Selected account role does not exist.', 400, 'INVALID_ROLE');
+      await conn.query(
+        `INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)`,
+        [userId, roleRows[0].id]
+      );
 
       // Audit log
       await conn.query(
@@ -1207,19 +1950,54 @@ export class AdminRepository {
     adminUsername: string;
   }) {
     const passwordHash = await bcrypt.hash(payload.newPassword, 10);
-    await pool.query(
-      `UPDATE users SET password_hash = ?, password_changed_at = NOW(), failed_login_count = 0 WHERE id = ?`,
-      [passwordHash, payload.userId]
-    );
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [users] = await conn.query<RowDataPacket[]>(`SELECT id FROM users WHERE id = ? FOR UPDATE`, [payload.userId]);
+      if (!users.length) throw new AppError('User account not found.', 404, 'USER_NOT_FOUND');
+      await conn.query(
+        `UPDATE users SET password_hash = ?, password_changed_at = NOW(), failed_login_count = 0, must_change_password = 1 WHERE id = ?`,
+        [passwordHash, payload.userId]
+      );
+      await conn.query(
+        `UPDATE refresh_sessions SET revoked_at = NOW(3), revoked_reason = 'password_change' WHERE user_id = ? AND revoked_at IS NULL`,
+        [payload.userId]
+      );
+      await conn.query(
+        `INSERT INTO audit_logs (occurred_at, actor_user_id, actor_username, action, entity_type, entity_id, outcome, reason)
+         VALUES (NOW(), ?, ?, 'USER_PASSWORD_RESET', 'users', ?, 'success', 'Password reset initiated by administrator')`,
+        [payload.adminUserId, payload.adminUsername, String(payload.userId)]
+      );
+      await conn.commit();
+      return true;
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
 
-    // Audit log
-    await pool.query(
-      `INSERT INTO audit_logs (occurred_at, actor_user_id, actor_username, action, entity_type, entity_id, outcome, reason)
-       VALUES (NOW(), ?, ?, 'USER_PASSWORD_RESET', 'users', ?, 'success', 'Password reset initiated by administrator')`,
-      [payload.adminUserId, payload.adminUsername, String(payload.userId)]
+  async isLastActiveAdmin(userId: number): Promise<boolean> {
+    const [userRole] = await pool.query<RowDataPacket[]>(
+      `SELECT ur.user_id FROM user_roles ur
+       JOIN roles r ON ur.role_id = r.id
+       WHERE ur.user_id = ? AND r.code = 'system_admin'`,
+      [userId]
     );
+    if (userRole.length === 0) {
+      return false;
+    }
 
-    return true;
+    const [adminCount] = await pool.query<RowDataPacket[]>(
+      `SELECT COUNT(DISTINCT u.id) as active_admin_count
+       FROM users u
+       JOIN user_roles ur ON u.id = ur.user_id
+       JOIN roles r ON ur.role_id = r.id
+       WHERE r.code = 'system_admin' AND u.status = 'active'`
+    );
+    const count = Number(adminCount[0]?.active_admin_count || 0);
+    return count <= 1;
   }
 
   async updateUserRoles(payload: {
@@ -1228,6 +2006,14 @@ export class AdminRepository {
     adminUserId: number;
     adminUsername: string;
   }) {
+    const normalizedRoles = payload.roleCodes.map(r => (r === 'administrator' || r === 'admin') ? 'system_admin' : r);
+    if (!normalizedRoles.includes('system_admin')) {
+      const isLast = await this.isLastActiveAdmin(payload.userId);
+      if (isLast) {
+        throw new AppError('Cannot remove system_admin role from the last active administrator.', 403, 'LAST_ACTIVE_ADMIN_PROTECTED');
+      }
+    }
+
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
@@ -1323,6 +2109,12 @@ export class AdminRepository {
   }
 
   async updateUserStatus(userId: number, status: 'active' | 'disabled') {
+    if (status === 'disabled') {
+      const isLast = await this.isLastActiveAdmin(userId);
+      if (isLast) {
+        throw new AppError('Cannot deactivate the last active system administrator.', 403, 'LAST_ACTIVE_ADMIN_PROTECTED');
+      }
+    }
     const [res] = await pool.query<ResultSetHeader>(
       `UPDATE users SET status = ? WHERE id = ?`,
       [status, userId]
@@ -1371,6 +2163,7 @@ export class AdminRepository {
        JOIN academic_years ay ON s.academic_year_id = ay.id
        LEFT JOIN classrooms cr ON s.classroom_id = cr.id
        LEFT JOIN staff st ON s.homeroom_staff_id = st.id
+       WHERE s.deleted_at IS NULL
        ORDER BY g.grade_level ASC, s.name ASC`
     );
 
@@ -1379,14 +2172,15 @@ export class AdminRepository {
     );
 
     const [subjects] = await pool.query<RowDataPacket[]>(
-      `SELECT * FROM subjects ORDER BY code ASC`
+      `SELECT * FROM subjects WHERE deleted_at IS NULL ORDER BY code ASC`
     );
 
     const [gradeSubjects] = await pool.query<RowDataPacket[]>(
-      `SELECT gs.*, g.display_name as grade_name, s.code as subject_code, s.name as subject_name
+      `SELECT gs.*, g.display_name as grade_name, s.code as subject_code, s.name as subject_name, ay.name as academic_year_name
        FROM grade_subjects gs
        JOIN grades g ON gs.grade_id = g.id
        JOIN subjects s ON gs.subject_id = s.id
+       LEFT JOIN academic_years ay ON ay.id = gs.academic_year_id
        ORDER BY g.grade_level ASC, s.name ASC`
     );
 
@@ -1399,6 +2193,50 @@ export class AdminRepository {
       subjects,
       gradeSubjects
     };
+  }
+
+  async getGradeById(id: number) {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, grade_level, display_name, is_active FROM grades WHERE id = ? LIMIT 1`, [id]
+    );
+    return rows[0] || null;
+  }
+
+  async createGrade(payload: { gradeLevel: number; displayName: string; adminUserId: number; adminUsername: string }) {
+    let res: ResultSetHeader;
+    try {
+      [res] = await pool.query<ResultSetHeader>(
+        `INSERT INTO grades (grade_level, display_name, has_streams, is_active)
+         VALUES (?, ?, ?, 1)`,
+        [payload.gradeLevel, payload.displayName, payload.gradeLevel >= 11 ? 1 : 0]
+      );
+    } catch (err) {
+      if ((err as any)?.code === 'ER_DUP_ENTRY') throw new AppError('That grade is already configured.', 409, 'DUPLICATE_GRADE');
+      throw err;
+    }
+    await pool.query(
+      `INSERT INTO audit_logs (occurred_at, actor_user_id, actor_username, action, entity_type, entity_id, outcome, changes, reason)
+       VALUES (NOW(), ?, ?, 'GRADE_CREATE', 'grades', ?, 'success', ?, 'Academic grade created by administrator')`,
+      [payload.adminUserId, payload.adminUsername, String(res.insertId), JSON.stringify({ gradeLevel: payload.gradeLevel, displayName: payload.displayName })]
+    );
+    return res.insertId;
+  }
+
+  async updateGrade(id: number, payload: { displayName?: string; isActive?: boolean; adminUserId: number; adminUsername: string }) {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, grade_level, display_name, is_active FROM grades WHERE id = ? LIMIT 1`, [id]
+    );
+    if (!rows.length) throw new AppError('Grade was not found.', 404, 'GRADE_NOT_FOUND');
+    const before = rows[0];
+    const displayName = payload.displayName ?? String(before.display_name);
+    const isActive = payload.isActive ?? Boolean(before.is_active);
+    await pool.query(`UPDATE grades SET display_name = ?, is_active = ? WHERE id = ?`, [displayName, isActive ? 1 : 0, id]);
+    await pool.query(
+      `INSERT INTO audit_logs (occurred_at, actor_user_id, actor_username, action, entity_type, entity_id, outcome, changes, reason)
+       VALUES (NOW(), ?, ?, 'GRADE_UPDATE', 'grades', ?, 'success', ?, 'Academic grade updated by administrator')`,
+      [payload.adminUserId, payload.adminUsername, String(id), JSON.stringify({ before: { displayName: before.display_name, isActive: Boolean(before.is_active) }, after: { displayName, isActive } })]
+    );
+    return true;
   }
 
   async createAcademicYear(payload: {
@@ -1471,20 +2309,27 @@ export class AdminRepository {
     homeroomStaffId?: number;
     classroomId?: number;
   }) {
-    const [res] = await pool.query<ResultSetHeader>(
-      `INSERT INTO sections (grade_id, academic_year_id, name, stream, capacity, homeroom_staff_id, classroom_id, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'active')`,
-      [
-        payload.gradeId,
-        payload.academicYearId,
-        payload.name,
-        payload.stream || 'none',
-        payload.capacity || 40,
-        payload.homeroomStaffId || null,
-        payload.classroomId || null
-      ]
+    const [gradeRows] = await pool.query<RowDataPacket[]>(
+      `SELECT g.id, g.grade_level, g.is_active, ay.status AS year_status
+       FROM grades g CROSS JOIN academic_years ay
+       WHERE g.id = ? AND ay.id = ? LIMIT 1`,
+      [payload.gradeId, payload.academicYearId]
     );
-    return res.insertId;
+    const grade = gradeRows[0];
+    if (!grade) throw new AppError('Selected grade or academic year was not found.', 404, 'ACADEMIC_REFERENCE_NOT_FOUND');
+    if (!Number(grade.is_active)) throw new AppError('Selected grade is inactive.', 409, 'GRADE_INACTIVE');
+    if (grade.year_status === 'closed') throw new AppError('Sections cannot be added to a closed academic year.', 409, 'ACADEMIC_YEAR_CLOSED');
+    try {
+      const [res] = await pool.query<ResultSetHeader>(
+        `INSERT INTO sections (grade_id, academic_year_id, name, stream, capacity, homeroom_staff_id, classroom_id, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'active')`,
+        [payload.gradeId, payload.academicYearId, payload.name, payload.stream || 'none', payload.capacity, payload.homeroomStaffId || null, payload.classroomId || null]
+      );
+      return res.insertId;
+    } catch (err) {
+      if ((err as any)?.code === 'ER_DUP_ENTRY') throw new AppError('That section name already exists for this grade and academic year.', 409, 'DUPLICATE_SECTION');
+      throw err;
+    }
   }
 
   async updateSection(id: number, payload: {
@@ -1495,46 +2340,86 @@ export class AdminRepository {
     status?: string;
   }) {
     const fields: string[] = [];
-    const params: any[] = [];
+    const values: any[] = [];
+    if (payload.name !== undefined) { fields.push('name = ?'); values.push(payload.name); }
+    if (payload.capacity !== undefined) { fields.push('capacity = ?'); values.push(payload.capacity); }
+    if (payload.homeroomStaffId !== undefined) { fields.push('homeroom_staff_id = ?'); values.push(payload.homeroomStaffId || null); }
+    if (payload.classroomId !== undefined) { fields.push('classroom_id = ?'); values.push(payload.classroomId || null); }
+    if (payload.status !== undefined) { fields.push('status = ?'); values.push(payload.status); }
+    if (!fields.length) throw new AppError('No section changes were provided.', 400, 'EMPTY_SECTION_UPDATE');
 
-    if (payload.name) { fields.push('name = ?'); params.push(payload.name); }
-    if (payload.capacity) { fields.push('capacity = ?'); params.push(payload.capacity); }
-    if (payload.homeroomStaffId !== undefined) { fields.push('homeroom_staff_id = ?'); params.push(payload.homeroomStaffId || null); }
-    if (payload.classroomId !== undefined) { fields.push('classroom_id = ?'); params.push(payload.classroomId || null); }
-    if (payload.status) { fields.push('status = ?'); params.push(payload.status); }
-
-    if (fields.length === 0) return true;
-    params.push(id);
-
-    await pool.query(`UPDATE sections SET ${fields.join(', ')} WHERE id = ?`, params);
-    return true;
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [sectionRows] = await conn.query<RowDataPacket[]>(
+        `SELECT sec.id, sec.capacity, sec.grade_id, sec.academic_year_id, g.is_active AS grade_active, ay.status AS year_status
+         FROM sections sec JOIN grades g ON g.id = sec.grade_id JOIN academic_years ay ON ay.id = sec.academic_year_id
+         WHERE sec.id = ? AND sec.deleted_at IS NULL FOR UPDATE`, [id]
+      );
+      if (!sectionRows.length) throw new AppError('Section was not found.', 404, 'SECTION_NOT_FOUND');
+      if (payload.status === 'active' && (!Number(sectionRows[0].grade_active) || sectionRows[0].year_status === 'closed')) {
+        throw new AppError('A section can only be activated when its grade and academic year are active.', 409, 'SECTION_PARENT_INACTIVE');
+      }
+      const [countRows] = await conn.query<RowDataPacket[]>(
+        `SELECT COUNT(*) AS active_count FROM enrollments WHERE section_id = ? AND status = 'active'`, [id]
+      );
+      if (payload.capacity !== undefined && Number(payload.capacity) < Number(countRows[0]?.active_count || 0)) {
+        throw new AppError(`Capacity cannot be lower than the ${Number(countRows[0]?.active_count || 0)} active enrollments.`, 409, 'CAPACITY_BELOW_ENROLLMENT');
+      }
+      values.push(id);
+      await conn.query(`UPDATE sections SET ${fields.join(', ')} WHERE id = ?`, values);
+      await conn.commit();
+      return true;
+    } catch (err) {
+      await conn.rollback();
+      if ((err as any)?.code === 'ER_DUP_ENTRY') throw new AppError('That section name already exists for this grade and academic year.', 409, 'DUPLICATE_SECTION');
+      throw err;
+    } finally {
+      conn.release();
+    }
   }
 
   async createSubject(payload: {
     code: string;
     name: string;
     nameAm?: string;
+    description?: string;
   }) {
-    const [res] = await pool.query<ResultSetHeader>(
-      `INSERT INTO subjects (code, name, name_am, status) VALUES (?, ?, ?, 'active')`,
-      [payload.code, payload.name, payload.nameAm || null]
-    );
-    return res.insertId;
+    try {
+      const [res] = await pool.query<ResultSetHeader>(
+        `INSERT INTO subjects (code, name, name_am, description, status) VALUES (?, ?, ?, ?, 'active')`,
+        [payload.code, payload.name, payload.nameAm || null, payload.description || null]
+      );
+      return res.insertId;
+    } catch (err) {
+      if ((err as any)?.code === 'ER_DUP_ENTRY') throw new AppError('Subject code already exists.', 409, 'DUPLICATE_SUBJECT_CODE');
+      throw err;
+    }
   }
 
   async updateSubject(id: number, payload: {
+    code?: string;
     name?: string;
     nameAm?: string;
+    description?: string;
     status?: string;
   }) {
     const fields: string[] = [];
     const params: any[] = [];
+    if (payload.code) { fields.push('code = ?'); params.push(payload.code); }
     if (payload.name) { fields.push('name = ?'); params.push(payload.name); }
     if (payload.nameAm !== undefined) { fields.push('name_am = ?'); params.push(payload.nameAm || null); }
+    if (payload.description !== undefined) { fields.push('description = ?'); params.push(payload.description || null); }
     if (payload.status) { fields.push('status = ?'); params.push(payload.status); }
     if (fields.length === 0) return true;
     params.push(id);
-    await pool.query(`UPDATE subjects SET ${fields.join(', ')} WHERE id = ?`, params);
+    try {
+      const [result] = await pool.query<ResultSetHeader>(`UPDATE subjects SET ${fields.join(', ')} WHERE id = ?`, params);
+      if (!result.affectedRows) throw new AppError('Subject was not found.', 404, 'SUBJECT_NOT_FOUND');
+    } catch (err) {
+      if ((err as any)?.code === 'ER_DUP_ENTRY') throw new AppError('Subject code already exists.', 409, 'DUPLICATE_SUBJECT_CODE');
+      throw err;
+    }
     return true;
   }
 
@@ -1544,16 +2429,34 @@ export class AdminRepository {
     stream: 'all' | 'natural_science' | 'social_science';
     isCompulsory?: boolean;
     periodsPerWeek?: number;
+    academicYearId?: number;
   }) {
+    const [gradeRows] = await pool.query<RowDataPacket[]>(`SELECT id, grade_level FROM grades WHERE id = ? AND is_active = 1`, [payload.gradeId]);
+    if (!gradeRows.length) throw new AppError('Selected grade is inactive or unavailable.', 409, 'GRADE_INACTIVE');
+    if (Number(gradeRows[0].grade_level) <= 10 && payload.stream !== 'all') throw new AppError('Grades 9 and 10 use the common curriculum.', 400, 'GRADE_STREAM_MISMATCH');
+    const [subjectRows] = await pool.query<RowDataPacket[]>(`SELECT id FROM subjects WHERE id = ? AND status = 'active' AND deleted_at IS NULL`, [payload.subjectId]);
+    if (!subjectRows.length) throw new AppError('Selected subject is inactive or unavailable.', 409, 'SUBJECT_INACTIVE');
+    if (payload.academicYearId) {
+      const [yearRows] = await pool.query<RowDataPacket[]>(`SELECT id FROM academic_years WHERE id = ?`, [payload.academicYearId]);
+      if (!yearRows.length) throw new AppError('Selected academic year was not found.', 404, 'ACADEMIC_YEAR_NOT_FOUND');
+    }
     const [res] = await pool.query<ResultSetHeader>(
-      `INSERT INTO grade_subjects (grade_id, subject_id, stream, is_compulsory, periods_per_week)
-       VALUES (?, ?, ?, ?, ?)`,
-      [payload.gradeId, payload.subjectId, payload.stream || 'all', payload.isCompulsory ? 1 : 0, payload.periodsPerWeek || 4]
+      `INSERT INTO grade_subjects (grade_id, subject_id, stream, academic_year_id, is_compulsory, periods_per_week)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [payload.gradeId, payload.subjectId, payload.stream || 'all', payload.academicYearId || null, payload.isCompulsory ? 1 : 0, payload.periodsPerWeek || 4]
     );
     return res.insertId;
   }
 
   async removeGradeSubject(id: number) {
+    const [mappingRows] = await pool.query<RowDataPacket[]>(`SELECT grade_id, subject_id FROM grade_subjects WHERE id = ?`, [id]);
+    if (!mappingRows.length) throw new AppError('Curriculum mapping was not found.', 404, 'GRADE_SUBJECT_NOT_FOUND');
+    const [usedRows] = await pool.query<RowDataPacket[]>(
+      `SELECT 1 AS used FROM teaching_assignments ta JOIN sections sec ON sec.id = ta.section_id
+       WHERE sec.grade_id = ? AND ta.subject_id = ? LIMIT 1`,
+      [mappingRows[0].grade_id, mappingRows[0].subject_id]
+    );
+    if (usedRows.length) throw new AppError('This curriculum mapping has teaching history; deactivate or update the subject instead of deleting it.', 409, 'GRADE_SUBJECT_IN_USE');
     await pool.query(`DELETE FROM grade_subjects WHERE id = ?`, [id]);
     return true;
   }
@@ -1662,6 +2565,7 @@ export class AdminRepository {
        FROM sections sec
        JOIN grades g ON sec.grade_id = g.id
        JOIN grade_subjects gs ON g.id = gs.grade_id AND (gs.stream = 'all' OR gs.stream = sec.stream)
+         AND (gs.academic_year_id IS NULL OR gs.academic_year_id = sec.academic_year_id)
        JOIN subjects sub ON gs.subject_id = sub.id
        WHERE sec.status = 'active'
        AND NOT EXISTS (
@@ -1679,6 +2583,29 @@ export class AdminRepository {
     sectionId: number;
     academicYearId: number;
   }) {
+    const [scopeRows] = await pool.query<RowDataPacket[]>(
+      `SELECT sec.id, sec.academic_year_id, sec.stream, g.id AS grade_id, g.is_active AS grade_active,
+              sub.status AS subject_status, sub.deleted_at AS subject_deleted
+       FROM sections sec
+       JOIN grades g ON g.id = sec.grade_id
+       JOIN subjects sub ON sub.id = ?
+       WHERE sec.id = ? AND sec.status = 'active' AND sec.deleted_at IS NULL`,
+      [payload.subjectId, payload.sectionId]
+    );
+    if (!scopeRows.length) throw new AppError('Active section and subject are required.', 404, 'ASSIGNMENT_SCOPE_NOT_FOUND');
+    const scope = scopeRows[0];
+    if (Number(scope.academic_year_id) !== Number(payload.academicYearId)) throw new AppError('Assignment academic year must match its section.', 400, 'ACADEMIC_YEAR_MISMATCH');
+    if (!Number(scope.grade_active)) throw new AppError('The section grade is inactive.', 409, 'GRADE_INACTIVE');
+    if (scope.subject_status !== 'active' || scope.subject_deleted) throw new AppError('Subject is inactive.', 409, 'SUBJECT_INACTIVE');
+    const [mappingRows] = await pool.query<RowDataPacket[]>(
+      `SELECT gs.id FROM grade_subjects gs
+       WHERE gs.grade_id = ? AND gs.subject_id = ?
+         AND (gs.stream = 'all' OR gs.stream = ?)
+         AND (gs.academic_year_id IS NULL OR gs.academic_year_id = ?)
+       LIMIT 1`,
+      [scope.grade_id, payload.subjectId, scope.stream, payload.academicYearId]
+    );
+    if (!mappingRows.length) throw new AppError('Subject is not mapped to this grade, stream, and academic year.', 409, 'SUBJECT_NOT_IN_CURRICULUM');
     // Check if duplicate exists
     const [exist] = await pool.query<RowDataPacket[]>(
       `SELECT id FROM teaching_assignments 
@@ -1831,12 +2758,25 @@ export class AdminRepository {
     endTime: string;
     label: string;
   }) {
-    const [res] = await pool.query<ResultSetHeader>(
-      `INSERT INTO time_slots (day_of_week, start_time, end_time, label)
-       VALUES (?, ?, ?, ?)`,
-      [payload.dayOfWeek, payload.startTime, payload.endTime, payload.label]
-    );
-    return res.insertId;
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [overlaps] = await conn.query<RowDataPacket[]>(
+        `SELECT id FROM time_slots WHERE day_of_week = ? AND start_time < ? AND end_time > ? LIMIT 1 FOR UPDATE`,
+        [payload.dayOfWeek, payload.endTime, payload.startTime]
+      );
+      if (overlaps.length) throw new AppError('This period overlaps an existing lesson period on that day.', 409, 'TIME_SLOT_OVERLAP');
+      const [res] = await conn.query<ResultSetHeader>(
+        `INSERT INTO time_slots (day_of_week, start_time, end_time, label) VALUES (?, ?, ?, ?)`,
+        [payload.dayOfWeek, payload.startTime, payload.endTime, payload.label.trim()]
+      );
+      await conn.commit();
+      return res.insertId;
+    } catch (err: any) {
+      await conn.rollback();
+      if (err?.code === 'ER_DUP_ENTRY') throw new AppError('A period with this day and start time already exists.', 409, 'DUPLICATE_TIME_SLOT');
+      throw err;
+    } finally { conn.release(); }
   }
 
   // =========================================================================
@@ -1931,6 +2871,7 @@ export class AdminRepository {
     let sql = `
       SELECT 
         a.id,
+        a.term_id,
         a.title,
         a.max_score,
         a.weight,
@@ -1971,6 +2912,157 @@ export class AdminRepository {
     sql += ` ORDER BY a.assessment_date DESC, g.grade_level ASC`;
     const [rows] = await pool.query<RowDataPacket[]>(sql, params);
     return rows;
+  }
+
+  async getAssessmentConfigurationOptions() {
+    const [assignments] = await pool.query<RowDataPacket[]>(
+      `SELECT ta.id AS teaching_assignment_id, ta.academic_year_id, ay.name AS academic_year_name,
+              sec.id AS section_id, sec.name AS section_name, sec.stream,
+              g.grade_level, g.display_name AS grade_name, sub.id AS subject_id, sub.code AS subject_code,
+              sub.name AS subject_name, CONCAT_WS(' ', st.first_name, st.father_name) AS teacher_name
+       FROM teaching_assignments ta
+       JOIN sections sec ON sec.id = ta.section_id AND sec.status = 'active' AND sec.deleted_at IS NULL
+       JOIN grades g ON g.id = sec.grade_id AND g.is_active = 1
+       JOIN subjects sub ON sub.id = ta.subject_id AND sub.status = 'active' AND sub.deleted_at IS NULL
+       JOIN staff st ON st.id = ta.staff_id AND st.status = 'active'
+       JOIN academic_years ay ON ay.id = ta.academic_year_id AND ay.status <> 'closed'
+       WHERE ta.is_active = 1
+       ORDER BY ay.start_date DESC, g.grade_level, sec.name, sub.name, teacher_name`
+    );
+    const [terms] = await pool.query<RowDataPacket[]>(
+      `SELECT t.id, t.name, t.academic_year_id, t.start_date, t.end_date, t.status,
+              ay.name AS academic_year_name
+       FROM terms t JOIN academic_years ay ON ay.id = t.academic_year_id
+       WHERE t.status <> 'closed' AND ay.status <> 'closed'
+       ORDER BY ay.start_date DESC, t.term_no`
+    );
+    const [types] = await pool.query<RowDataPacket[]>(
+      `SELECT id, code, name FROM assessment_types WHERE is_active = 1 ORDER BY id`
+    );
+    return { assignments, terms, types };
+  }
+
+  async createAdminAssessment(payload: {
+    teachingAssignmentId: number; termId: number; assessmentTypeId: number; title: string;
+    maxScore: number; weight: number; assessmentDate: string; userId: number; username: string;
+  }) {
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [scopeRows] = await conn.query<RowDataPacket[]>(
+        `SELECT ta.id, ta.academic_year_id, sec.id AS section_id, sec.name AS section_name,
+                sec.status AS section_status, sec.deleted_at AS section_deleted, g.is_active AS grade_active,
+                sub.status AS subject_status, sub.deleted_at AS subject_deleted,
+                t.id AS term_id, t.academic_year_id AS term_year_id, t.start_date, t.end_date, t.status AS term_status,
+                ay.status AS year_status, at.name AS assessment_type_name
+         FROM teaching_assignments ta
+         JOIN sections sec ON sec.id = ta.section_id
+         JOIN grades g ON g.id = sec.grade_id
+         JOIN subjects sub ON sub.id = ta.subject_id
+         JOIN terms t ON t.id = ?
+         JOIN academic_years ay ON ay.id = t.academic_year_id
+         JOIN assessment_types at ON at.id = ? AND at.is_active = 1
+         WHERE ta.id = ? AND ta.is_active = 1 FOR UPDATE`,
+        [payload.termId, payload.assessmentTypeId, payload.teachingAssignmentId]
+      );
+      const scope = scopeRows[0];
+      if (!scope) throw new AppError('Choose an active teaching assignment, term, and assessment type.', 404, 'ASSESSMENT_SCOPE_NOT_FOUND');
+      if (Number(scope.academic_year_id) !== Number(scope.term_year_id)) throw new AppError('Assessment term must belong to the teaching assignment academic year.', 400, 'ACADEMIC_YEAR_MISMATCH');
+      if (scope.section_status !== 'active' || scope.section_deleted || !Number(scope.grade_active) || scope.subject_status !== 'active' || scope.subject_deleted || scope.term_status === 'closed' || scope.year_status === 'closed') {
+        throw new AppError('Assessment scope includes an inactive academic record.', 409, 'ASSESSMENT_SCOPE_INACTIVE');
+      }
+      if (payload.assessmentDate < String(scope.start_date).slice(0, 10) || payload.assessmentDate > String(scope.end_date).slice(0, 10)) {
+        throw new AppError('Assessment date must fall within the selected term.', 400, 'ASSESSMENT_DATE_OUTSIDE_TERM');
+      }
+      const [settingRows] = await conn.query<RowDataPacket[]>(`SELECT value_json FROM system_settings WHERE setting_key = 'grading.weights_must_total_100' LIMIT 1`);
+      let mustTotal = settingRows[0]?.value_json;
+      if (typeof mustTotal === 'string') { try { mustTotal = JSON.parse(mustTotal); } catch { mustTotal = mustTotal === 'true'; } }
+      if (mustTotal) {
+        const [weightRows] = await conn.query<RowDataPacket[]>(
+          `SELECT COALESCE(SUM(weight), 0) AS assigned_weight FROM assessments WHERE teaching_assignment_id = ? AND term_id = ?`,
+          [payload.teachingAssignmentId, payload.termId]
+        );
+        if (Number(weightRows[0]?.assigned_weight || 0) + payload.weight > 100.0001) {
+          throw new AppError('Assessment weights for this class and term cannot exceed 100%.', 409, 'ASSESSMENT_WEIGHT_LIMIT');
+        }
+      }
+      const [inserted] = await conn.query<ResultSetHeader>(
+        `INSERT INTO assessments (teaching_assignment_id, term_id, assessment_type_id, title, max_score, weight, assessment_date, status, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?)`,
+        [payload.teachingAssignmentId, payload.termId, payload.assessmentTypeId, payload.title, payload.maxScore, payload.weight, payload.assessmentDate, payload.userId]
+      );
+      await conn.query(
+        `INSERT INTO audit_logs (actor_user_id, actor_username, action, entity_type, entity_id, outcome, changes, reason)
+         VALUES (?, ?, 'assessment.configure', 'assessments', ?, 'success', ?, 'Assessment configured by administrator')`,
+        [payload.userId, payload.username, String(inserted.insertId), JSON.stringify({ ...payload, userId: undefined, username: undefined, status: 'draft' })]
+      );
+      await conn.commit();
+      return inserted.insertId;
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async updateAdminAssessment(id: number, payload: { title?: string; maxScore?: number; weight?: number; assessmentDate?: string; status?: 'draft' | 'open' | 'closed'; userId: number; username: string }) {
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [rows] = await conn.query<RowDataPacket[]>(`SELECT * FROM assessments WHERE id = ? FOR UPDATE`, [id]);
+      const current = rows[0];
+      if (!current) throw new AppError('Assessment was not found.', 404, 'ASSESSMENT_NOT_FOUND');
+      const [markRows] = await conn.query<RowDataPacket[]>(`SELECT COUNT(*) AS mark_count FROM marks WHERE assessment_id = ?`, [id]);
+      const hasMarks = Number(markRows[0]?.mark_count || 0) > 0;
+      if (hasMarks && ['title', 'maxScore', 'weight', 'assessmentDate'].some((key) => (payload as any)[key] !== undefined)) {
+        throw new AppError('Assessment details cannot be edited after marks have been entered.', 409, 'ASSESSMENT_HAS_MARKS');
+      }
+      if (payload.assessmentDate !== undefined || payload.weight !== undefined) {
+        const [scopeRows] = await conn.query<RowDataPacket[]>(
+          `SELECT a.teaching_assignment_id, a.term_id, t.start_date, t.end_date
+           FROM assessments a JOIN terms t ON t.id = a.term_id WHERE a.id = ?`, [id]
+        );
+        const scope = scopeRows[0];
+        if (payload.assessmentDate !== undefined && (payload.assessmentDate < String(scope.start_date).slice(0, 10) || payload.assessmentDate > String(scope.end_date).slice(0, 10))) {
+          throw new AppError('Assessment date must fall within the selected term.', 400, 'ASSESSMENT_DATE_OUTSIDE_TERM');
+        }
+        if (payload.weight !== undefined) {
+          const [settingRows] = await conn.query<RowDataPacket[]>(`SELECT value_json FROM system_settings WHERE setting_key = 'grading.weights_must_total_100' LIMIT 1`);
+          let mustTotal = settingRows[0]?.value_json;
+          if (typeof mustTotal === 'string') { try { mustTotal = JSON.parse(mustTotal); } catch { mustTotal = mustTotal === 'true'; } }
+          if (mustTotal) {
+            const [weightRows] = await conn.query<RowDataPacket[]>(
+              `SELECT COALESCE(SUM(weight), 0) AS assigned_weight FROM assessments WHERE teaching_assignment_id = ? AND term_id = ? AND id <> ?`,
+              [scope.teaching_assignment_id, scope.term_id, id]
+            );
+            if (Number(weightRows[0]?.assigned_weight || 0) + payload.weight > 100.0001) throw new AppError('Assessment weights for this class and term cannot exceed 100%.', 409, 'ASSESSMENT_WEIGHT_LIMIT');
+          }
+        }
+      }
+      const changes: string[] = [];
+      const values: any[] = [];
+      if (payload.title !== undefined) { changes.push('title = ?'); values.push(payload.title); }
+      if (payload.maxScore !== undefined) { changes.push('max_score = ?'); values.push(payload.maxScore); }
+      if (payload.weight !== undefined) { changes.push('weight = ?'); values.push(payload.weight); }
+      if (payload.assessmentDate !== undefined) { changes.push('assessment_date = ?'); values.push(payload.assessmentDate); }
+      if (payload.status !== undefined) { changes.push('status = ?'); values.push(payload.status); }
+      if (!changes.length) throw new AppError('No assessment changes were provided.', 400, 'EMPTY_ASSESSMENT_UPDATE');
+      values.push(id);
+      await conn.query(`UPDATE assessments SET ${changes.join(', ')} WHERE id = ?`, values);
+      await conn.query(
+        `INSERT INTO audit_logs (actor_user_id, actor_username, action, entity_type, entity_id, outcome, changes, reason)
+         VALUES (?, ?, 'assessment.update', 'assessments', ?, 'success', ?, 'Assessment configuration updated by administrator')`,
+        [payload.userId, payload.username, String(id), JSON.stringify(Object.fromEntries(Object.entries(payload).filter(([key]) => !['userId', 'username'].includes(key))))]
+      );
+      await conn.commit();
+      return true;
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
   }
 
   async approveAssessmentMarks(assessmentId: number, adminUserId: number, adminUsername: string) {
@@ -2172,7 +3264,7 @@ export class AdminRepository {
 
     const [loans] = await pool.query<RowDataPacket[]>(
       `SELECT 
-         l.id, l.issued_at, l.due_at, l.returned_at,
+         l.id, l.checkout_at as issued_at, l.due_at, l.returned_at,
          b.title as book_title,
          b.author as book_author,
          cp.barcode,
@@ -2180,7 +3272,7 @@ export class AdminRepository {
          CONCAT_WS(' ', s.first_name, s.father_name) as student_name,
          CASE WHEN l.returned_at IS NULL AND l.due_at < NOW() THEN 1 ELSE 0 END as is_overdue
        FROM library_loans l
-       JOIN book_copies cp ON l.book_copy_id = cp.id
+       JOIN book_copies cp ON l.copy_id = cp.id
        JOIN books b ON cp.book_id = b.id
        JOIN students s ON l.student_id = s.id
        WHERE l.returned_at IS NULL
@@ -2220,6 +3312,7 @@ export class AdminRepository {
        FROM announcements a
        LEFT JOIN users u ON a.created_by = u.id
        LEFT JOIN announcement_targets t ON a.id = t.announcement_id
+       WHERE a.deleted_at IS NULL
        ORDER BY a.created_at DESC
        LIMIT ?`,
       [limit]
@@ -2231,6 +3324,7 @@ export class AdminRepository {
     title: string;
     body: string;
     userId: number;
+    username: string;
     status?: 'draft' | 'published';
     targetRole?: string;
   }) {
@@ -2241,21 +3335,39 @@ export class AdminRepository {
 
       const [res] = await conn.query<ResultSetHeader>(
         `INSERT INTO announcements (title, body, status, created_by, published_by, published_at)
-         VALUES (?, ?, ?, ?, ?, IF(? = 'published', NOW(), NULL))`,
-        [payload.title, payload.body, status, payload.userId, payload.userId, status]
+         VALUES (?, ?, ?, ?, IF(? = 'published', ?, NULL), IF(? = 'published', NOW(3), NULL))`,
+        [payload.title, payload.body, status, payload.userId, status, payload.userId, status]
       );
       const annId = res.insertId;
 
       if (payload.targetRole) {
-        await conn.query(
-          `INSERT INTO announcement_targets (announcement_id, target_type)
-           VALUES (?, ?)`,
-          [annId, payload.targetRole === 'all' ? 'all' : 'role']
-        );
+        if (payload.targetRole === 'all') {
+          await conn.query(
+            `INSERT INTO announcement_targets (announcement_id, target_type, target_id) VALUES (?, 'all', NULL)`,
+            [annId]
+          );
+        } else {
+          const [roleRows] = await conn.query<RowDataPacket[]>(`SELECT id FROM roles WHERE code = ? LIMIT 1`, [payload.targetRole]);
+          if (!roleRows.length) throw new AppError('The selected announcement audience role does not exist.', 400, 'INVALID_ANNOUNCEMENT_AUDIENCE');
+          await conn.query(
+            `INSERT INTO announcement_targets (announcement_id, target_type, target_id) VALUES (?, 'role', ?)`,
+            [annId, roleRows[0].id]
+          );
+        }
       }
 
+      let delivery = { recipients: 0, emailsQueued: 0 };
+      if (status === 'published') {
+        delivery = await this.enqueueAnnouncementNotifications(conn, annId, payload.userId);
+      }
+      await conn.query(
+        `INSERT INTO audit_logs (occurred_at, actor_user_id, actor_username, action, entity_type, entity_id, outcome, changes, reason)
+         VALUES (NOW(3), ?, ?, 'ANNOUNCEMENT_CREATE', 'announcements', ?, 'success', ?, 'Administrator created an announcement')`,
+        [payload.userId, payload.username, String(annId), JSON.stringify({ status, targetRole: payload.targetRole || 'all', ...delivery })]
+      );
+
       await conn.commit();
-      return annId;
+      return { id: annId, ...delivery };
     } catch (err) {
       await conn.rollback();
       throw err;
@@ -2264,20 +3376,117 @@ export class AdminRepository {
     }
   }
 
-  async updateAnnouncementStatus(id: number, status: 'draft' | 'published' | 'archived') {
-    await pool.query(
-      `UPDATE announcements 
-       SET status = ?, published_at = IF(? = 'published' AND published_at IS NULL, NOW(), published_at) 
-       WHERE id = ?`,
-      [status, status, id]
-    );
-    return true;
+  async updateAnnouncementStatus(id: number, status: 'draft' | 'published' | 'archived', publisherId: number, publisherUsername: string) {
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [rows] = await conn.query<RowDataPacket[]>(`SELECT id, status, published_by FROM announcements WHERE id = ? AND deleted_at IS NULL FOR UPDATE`, [id]);
+      if (!rows.length) throw new AppError('Announcement was not found.', 404, 'ANNOUNCEMENT_NOT_FOUND');
+      const wasPublished = rows[0].status === 'published';
+      await conn.query(
+        `UPDATE announcements SET status = ?, published_by = IF(? = 'published', COALESCE(published_by, ?), published_by),
+         published_at = IF(? = 'published' AND published_at IS NULL, NOW(3), published_at) WHERE id = ?`,
+        [status, status, publisherId, status, id]
+      );
+      const delivery = status === 'published' && !wasPublished
+        ? await this.enqueueAnnouncementNotifications(conn, id, publisherId)
+        : { recipients: 0, emailsQueued: 0 };
+      await conn.query(
+        `INSERT INTO audit_logs (occurred_at, actor_user_id, actor_username, action, entity_type, entity_id, outcome, changes, reason)
+         VALUES (NOW(3), ?, ?, 'ANNOUNCEMENT_STATUS_UPDATE', 'announcements', ?, 'success', ?, 'Administrator changed announcement status')`,
+        [publisherId, publisherUsername, String(id), JSON.stringify({ from: rows[0].status, to: status, ...delivery })]
+      );
+      await conn.commit();
+      return { success: true, ...delivery };
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
   }
 
-  async deleteAnnouncement(id: number) {
-    await pool.query(`DELETE FROM announcement_targets WHERE announcement_id = ?`, [id]);
-    await pool.query(`DELETE FROM announcements WHERE id = ?`, [id]);
-    return true;
+  private async enqueueAnnouncementNotifications(conn: PoolConnection, announcementId: number, publisherId: number) {
+    const [announcementRows] = await conn.query<RowDataPacket[]>(`SELECT title, body FROM announcements WHERE id = ?`, [announcementId]);
+    const [targetRows] = await conn.query<RowDataPacket[]>(
+      `SELECT target.target_type, r.code AS role_code
+       FROM announcement_targets target LEFT JOIN roles r ON r.id = target.target_id
+       WHERE target.announcement_id = ?`, [announcementId]
+    );
+    if (!targetRows.length) {
+      await conn.query(`INSERT INTO announcement_targets (announcement_id, target_type, target_id) VALUES (?, 'all', NULL)`, [announcementId]);
+      targetRows.push({ target_type: 'all', role_code: null } as RowDataPacket);
+    }
+    const [recipients] = await conn.query<RowDataPacket[]>(
+      `SELECT DISTINCT u.id, u.email
+       FROM announcement_targets target
+       JOIN users u ON u.status = 'active'
+       JOIN user_roles ur ON ur.user_id = u.id
+       JOIN roles r ON r.id = ur.role_id
+       WHERE target.announcement_id = ? AND (
+         target.target_type = 'all' OR (target.target_type = 'role' AND target.target_id = r.id)
+       )`, [announcementId]
+    );
+    const title = String(announcementRows[0]?.title || 'School announcement');
+    const body = String(announcementRows[0]?.body || '');
+    let emailsQueued = 0;
+    const noticePayload = JSON.stringify({ entity: 'announcements', announcementId });
+    const emailPayload = JSON.stringify({ text: `${body}\n\nSign in to your school account to view this announcement.` });
+    for (let offset = 0; offset < recipients.length; offset += 200) {
+      const batch = recipients.slice(offset, offset + 200);
+      const noticeValues = batch.flatMap((recipient) => [recipient.id, title, body.slice(0, 1000), noticePayload]);
+      const noticePlaceholders = batch.map(() => `(?,'announcement',?,?,?)`).join(',');
+      await conn.query(
+        `INSERT INTO notifications (user_id, type, title, body, payload_json) VALUES ${noticePlaceholders}`,
+        noticeValues
+      );
+      const emailBatch = batch.filter((recipient) => Boolean(recipient.email));
+      if (emailBatch.length) {
+        const emailValues = emailBatch.flatMap((recipient) => [recipient.id, recipient.email, title.slice(0, 190), emailPayload]);
+        const emailPlaceholders = emailBatch.map(() => `(?,'email',?,?,?,'pending',NOW(3))`).join(',');
+        await conn.query(
+          `INSERT INTO notification_outbox (user_id, channel, recipient, subject, payload_json, status, next_attempt_at)
+           VALUES ${emailPlaceholders}`,
+          emailValues
+        );
+        emailsQueued += emailBatch.length;
+      }
+    }
+    const includesGuardians = targetRows.some((target) => target.target_type === 'all' || (target.target_type === 'role' && target.role_code === 'guardian'));
+    if (recipients.length && includesGuardians) {
+      const [prefRows] = await conn.query<RowDataPacket[]>(`SELECT value_json FROM system_settings WHERE setting_key = ? LIMIT 1`, [`user.notifications.${publisherId}`]);
+      let preferences: any = prefRows[0]?.value_json;
+      if (typeof preferences === 'string') { try { preferences = JSON.parse(preferences); } catch { preferences = null; } }
+      if (preferences?.guardianBroadcasts === true) {
+        await conn.query(
+          `INSERT INTO notifications (user_id, type, title, body, payload_json)
+           VALUES (?, 'announcement_dispatch', 'Announcement dispatch queued', ?, ?)`,
+          [publisherId, `${recipients.length} recipient inbox notices and ${emailsQueued} email messages were queued.`, JSON.stringify({ entity: 'announcements', announcementId, recipients: recipients.length, emailsQueued })]
+        );
+      }
+    }
+    return { recipients: recipients.length, emailsQueued };
+  }
+
+  async deleteAnnouncement(id: number, userId: number, username: string) {
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [result] = await conn.query<ResultSetHeader>(`UPDATE announcements SET deleted_at = NOW(3) WHERE id = ? AND deleted_at IS NULL`, [id]);
+      if (!result.affectedRows) throw new AppError('Announcement was not found.', 404, 'ANNOUNCEMENT_NOT_FOUND');
+      await conn.query(
+        `INSERT INTO audit_logs (occurred_at, actor_user_id, actor_username, action, entity_type, entity_id, outcome, reason)
+         VALUES (NOW(3), ?, ?, 'ANNOUNCEMENT_DELETE', 'announcements', ?, 'success', 'Administrator deleted an announcement')`,
+        [userId, username, String(id)]
+      );
+      await conn.commit();
+      return true;
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
   }
 
   async getRecentAuditLogs(limit = 50, filters?: { actor?: string; action?: string; outcome?: string }) {
@@ -2322,7 +3531,9 @@ export class AdminRepository {
   async getAdminProfile(userId: number) {
     const [uRows] = await pool.query<RowDataPacket[]>(
       `SELECT u.id, u.username, u.email, u.phone, u.status, u.created_at, u.last_login_at,
-              st.employee_no, st.first_name, st.father_name, st.job_title, st.department
+              st.employee_no, st.first_name, st.father_name, st.job_title, st.department,
+              (SELECT d.id FROM documents d WHERE d.owner_type = 'user' AND d.owner_id = u.id
+               AND d.doc_type = 'admin_profile_photo' AND d.deleted_at IS NULL ORDER BY d.id DESC LIMIT 1) AS photo_document_id
        FROM users u
        LEFT JOIN staff st ON u.id = st.user_id
        WHERE u.id = ?`,
@@ -2331,21 +3542,22 @@ export class AdminRepository {
     return uRows[0] || null;
   }
 
-  async updateAdminProfile(userId: number, payload: { phone?: string; email?: string }) {
+  async updateAdminProfile(userId: number, payload: { phone?: string; email?: string; photo?: { originalName?: string; mimeType?: string; dataBase64?: string } }, adminUserId = userId) {
     const fields: string[] = [];
     const params: any[] = [];
     if (payload.phone !== undefined) { fields.push('phone = ?'); params.push(payload.phone || null); }
     if (payload.email) { fields.push('email = ?'); params.push(payload.email); }
-    if (fields.length === 0) return true;
-    params.push(userId);
-    await pool.query(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`, params);
+    if (fields.length > 0) {
+      params.push(userId);
+      await pool.query(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`, params);
+    }
 
     // Also update staff record if linked
     const [staffCheck] = await pool.query<RowDataPacket[]>(
       `SELECT id FROM staff WHERE user_id = ?`,
       [userId]
     );
-    if (staffCheck.length > 0) {
+    if (staffCheck.length > 0 && (payload.phone !== undefined || payload.email)) {
       const sFields: string[] = [];
       const sParams: any[] = [];
       if (payload.phone !== undefined) { sFields.push('phone = ?'); sParams.push(payload.phone || null); }
@@ -2356,11 +3568,13 @@ export class AdminRepository {
       }
     }
 
+    if (payload.photo) await this.saveAdminProfilePhoto(userId, adminUserId, payload.photo);
+
     // Audit log
     await pool.query(
       `INSERT INTO audit_logs (occurred_at, actor_user_id, actor_username, action, entity_type, entity_id, outcome, changes, reason)
        VALUES (NOW(), ?, 'admin', 'PROFILE_UPDATE', 'users', ?, 'success', ?, 'Administrator profile details updated')`,
-      [userId, String(userId), JSON.stringify(payload)]
+      [userId, String(userId), JSON.stringify({ ...payload, photo: payload.photo ? 'uploaded' : undefined })]
     );
 
     return true;
@@ -2382,7 +3596,7 @@ export class AdminRepository {
 
     const newHash = await bcrypt.hash(newPass, 10);
     await pool.query(
-      `UPDATE users SET password_hash = ?, password_changed_at = NOW() WHERE id = ?`,
+      `UPDATE users SET password_hash = ?, password_changed_at = NOW(), must_change_password = 0 WHERE id = ?`,
       [newHash, userId]
     );
 
